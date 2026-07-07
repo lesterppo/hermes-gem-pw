@@ -1,0 +1,60 @@
+#!/usr/bin/env python3
+"""
+gem-pw-login — One-time sign-in for gem-pw.
+
+Launches visible Chromium. Sign into Gemini once.
+Profile is saved for all subsequent gem-pw calls.
+
+Usage: gem-pw-login
+"""
+
+import asyncio, os, sys, time
+from pathlib import Path
+
+_BASE = Path(os.environ.get("HERMES_HOME", os.environ.get("HOME", ""))) / ".gemini-cli"
+PROFILE = str(_BASE / "pw-profile")
+
+
+async def main():
+    from playwright.async_api import async_playwright
+
+    _BASE.mkdir(parents=True, exist_ok=True)
+
+    async with async_playwright() as p:
+        ctx = await p.chromium.launch_persistent_context(
+            user_data_dir=PROFILE, headless=False,
+            args=['--no-sandbox','--disable-gpu','--disable-blink-features=AutomationControlled'],
+            ignore_default_args=['--enable-automation'])
+        try:
+            page = await ctx.new_page()
+            await page.goto("https://gemini.google.com", wait_until="domcontentloaded", timeout=30000)
+            await asyncio.sleep(3)
+
+            body = await page.inner_text("body")
+            if "Sign in" not in body[:600]:
+                print("[pw] Already signed in!")
+            else:
+                print("\n=== Sign into Gemini in the Chromium window ===")
+                print("Waiting for sign-in... (2 min timeout)")
+                for _ in range(60):
+                    await asyncio.sleep(2)
+                    try:
+                        body = await page.inner_text("body")
+                        if "Sign in" not in body[:600] and len(body) > 200:
+                            print("[pw] Sign-in detected!")
+                            break
+                    except: pass
+                else:
+                    print("[pw] Timeout — did you sign in?")
+
+            await page.goto("https://gemini.google.com/gems/view", wait_until="domcontentloaded", timeout=30000)
+            await asyncio.sleep(3)
+            print(f"[pw] Profile saved to {PROFILE}")
+            print("[pw] Ready! Use: gem-pw <gem-id> 'prompt'")
+            await asyncio.sleep(2)
+        finally:
+            await ctx.close()
+
+
+if __name__ == "__main__":
+    asyncio.run(main())
