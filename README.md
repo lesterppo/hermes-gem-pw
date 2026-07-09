@@ -8,9 +8,11 @@ commands work.
 gem-pw <gem-id> "prompt"                  → Chat
 gem-pw <gem-id> -c sess.json "prompt"     → Multi-turn
 gem-pw --create "Name" "Instructions"      → Create Gem
+gem-pw --edit <gem-id> --name "New"        → Edit Gem
 gem-pw --delete <gem-id>                   → Delete Gem
 gem-pw --upload <gem-id> -f file "Q"       → Upload + ask
 gem-pw --img <gem-id> "description"        → Generate image
+gem-pw --help                              → Help
 ```
 
 ## Why
@@ -42,18 +44,26 @@ gem-pw 9d8c15f86f8b "Explain EBITDA in 2 sentences"
 # Multi-turn conversation
 gem-pw 9d8c15f86f8b -c /tmp/session.json "I am Peter"
 gem-pw 9d8c15f86f8b -c /tmp/session.json "What is my name?"
-# Second call remembers "Peter"
 
-# Create a Gem
-gem-pw --create "My Bot" "You are a helpful assistant"
+# Model selection + extended thinking
+gem-pw 9d8c15f86f8b -m pro --thinking extended -t 600 "deep analysis"
 
-# Delete a Gem
+# Create a Gem with knowledge
+gem-pw --create "My Bot" "You are a helpful assistant" -m pro
+gem-pw --create "Analyzer" "Analyze code" \
+  --knowledge-file paper.pdf \
+  --knowledge-code https://github.com/user/repo \
+  --knowledge-folder /path/to/project
+
+# Edit a Gem
+gem-pw --edit <id> --name "New Name"
+gem-pw --edit <id> --instructions "New system prompt..."
+gem-pw --edit <id> --knowledge-code https://github.com/user/repo
+gem-pw --edit <id> -m pro --thinking extended
+
+# Delete / Upload / Image
 gem-pw --delete abc123
-
-# Upload a file and ask about it
 gem-pw --upload 9d8c15f86f8b -f report.pdf "Summarize this"
-
-# Generate an image
 gem-pw --img 9d8c15f86f8b "A cat on a rainbow"
 ```
 
@@ -74,6 +84,8 @@ This tool is built for AI agent consumption. Key properties:
 - **Multi-turn**: `-c session.json` persists conversation across agent turns
 - **File-based I/O**: Responses on disk, pointer JSON on stdout
 - **Stateless**: Each call launches its own browser, no server to manage
+- **Gem CRUD**: Create, edit, delete Gems with knowledge management
+- **Configurable timeout**: `-t 600` for Pro+Extended Thinking with large knowledge
 
 Read `AGENTS.md` for the full agent integration guide.
 
@@ -88,10 +100,18 @@ Read `AGENTS.md` for the full agent integration guide.
 
 ```
 gem-pw → launch_persistent_context → Chromium (headful)
-         └─ uses ~/.gemini-cli/pw-profile/
+         └─ uses ~/.gemini-cli/cr-profile/
          └─ profile persists session across calls
          └─ page.evaluate() for custom element interaction
 ```
+
+## Changelog
+
+### v4 (Jul 2026)
+- `--edit` command: edit existing Gems (name, instructions, model, knowledge)
+- `-t` flag: configurable response timeout (default 120s, max 600s)
+- `--help`: fixed TypeError crash, now returns JSON help output
+- `-o` flag: specify output file path (previously was auto-named)
 
 ## License
 
