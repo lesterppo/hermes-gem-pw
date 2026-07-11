@@ -675,13 +675,14 @@ async def cmd_delete(gem_id):
 
 # ═══════════════ UPLOAD ═══════════════
 
-async def cmd_upload(gem_id, file_path, prompt):
-    fp = Path(file_path)
-    if not fp.exists(): return _err("FILE_NOT_FOUND", str(file_path))
+async def cmd_upload(gem_id, file_paths, prompt, out_path=None):
+    if isinstance(file_paths, str): file_paths = [file_paths]
+    missing = [fp for fp in file_paths if not Path(fp).exists()]
+    if missing: return _err("FILE_NOT_FOUND", ", ".join(missing))
 
     pw, ctx, page = await _launch()
     try:
-        _log(f"upload: {fp.name}")
+        _log(f"upload: {[Path(fp).name for fp in file_paths]}")
         await page.goto(f"https://gemini.google.com/gem/{gem_id}", wait_until="domcontentloaded", timeout=30000)
         await asyncio.sleep(5)
 
@@ -702,14 +703,14 @@ async def cmd_upload(gem_id, file_path, prompt):
 
         fi = await page.wait_for_selector('input[type="file"]', state='attached', timeout=5000)
         if not fi: return _err("NO_UPLOAD", "File input not found")
-        await fi.set_input_files(str(fp))
+        await fi.set_input_files(file_paths)
         await asyncio.sleep(3)
 
         if not await _type_and_submit(page, prompt): return _err("NO_INPUT", "Chat input not found")
         _log("waiting...")
         resp, elapsed = await _wait_response(page)
         if not resp.strip(): return _err("EMPTY", "No response")
-        return _save(resp, prompt, elapsed, gem_id=gem_id)
+        return _save(resp, prompt, elapsed, gem_id=gem_id, output_path=out_path)
     finally:
         try: await ctx.close()
         except: pass
@@ -861,14 +862,15 @@ async def main():
         if len(args) < 2: print(json.dumps(_err("USAGE", "--delete <gem-id>"))); sys.exit(1)
         print(json.dumps(await cmd_delete(args[1])))
     elif args[0] == "--upload":
-        fp = None; pp = []; i = 2; gid = args[1]
+        fps = []; pp = []; i = 2; gid = args[1]; out = None
         while i < len(args):
-            if args[i] == "-f" and i+1 < len(args): fp = args[i+1]; i += 2
+            if args[i] == "-f" and i+1 < len(args): fps.append(args[i+1]); i += 2
+            elif args[i] == "-o" and i+1 < len(args): out = args[i+1]; i += 2
             elif args[i].startswith("-"): i += 1
             else: pp.append(args[i]); i += 1
         p = " ".join(pp)
-        if not fp or not p: print(json.dumps(_err("USAGE", "--upload <id> -f <file> <question>"))); sys.exit(1)
-        print(json.dumps(await cmd_upload(gid, fp, p)))
+        if not fps or not p: print(json.dumps(_err("USAGE", "--upload <id> -f <file1> [-f <file2> ...] <question>"))); sys.exit(1)
+        print(json.dumps(await cmd_upload(gid, fps, p, out_path=out)))
     elif args[0] == "--img":
         if len(args) < 3: print(json.dumps(_err("USAGE", "--img <gem-id> <description>"))); sys.exit(1)
         print(json.dumps(await cmd_image(args[1], args[2])))
