@@ -157,10 +157,11 @@ gem-pw → launch_persistent_context → Chromium (headful)
 - **Verified model picker**: `_select_model` now reads back the picker aria-label
   and retries (up to 4×) until both base model AND Extended thinking are
   confirmed. If Pro/base never engages, the tool logs `model not confirmed`
-  instead of silently saving a Flash gem. (NOTE: as of 2026-07-15 the Gemini
-  model picker on this account only toggles Extended thinking — the base-model
-  selection does not register via automation. gem-pw reports this honestly via
-  the log rather than pretending Pro is active.)
+  instead of silently saving a Flash gem. (NOTE: when the account's Flash/Pro
+  quota is exhausted, Gemini only offers Flash-Lite as the selectable base
+  model — so Pro/Flash selection cannot engage via automation in that state.
+  This is a quota limitation, not a code bug. gem-pw reports it honestly via
+  the log rather than pretending Pro is active. Leave as-is.)
 - **Fixed `_click_text_button`**: was using `page.evaluate` which returns a
   non-clickable serialized value → all create/save operations crashed with
   `AttributeError`. Now uses `evaluate_handle` + a real click.
