@@ -183,6 +183,12 @@ python3 gem.py delete --gem "$ID"
 reuse a running CDP server. Use it when no CDP endpoint is available. See its
 `--help` for the full flag set.
 
+As of v4.2 (2026-07-15) gem-pw also gained: a multi-account guard before
+create/edit (refuses >1 signed-in account to avoid silent Pro→Flash
+downgrade), a verified model picker that retries until Pro+Extended is
+confirmed (and logs `model not confirmed` if the base model won't engage via
+automation), and a fix for a `_click_text_button` crash that broke all saves.
+
 ## License
 
 MIT

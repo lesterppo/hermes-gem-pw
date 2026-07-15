@@ -84,18 +84,27 @@ async def _pick(page, matchers):
     return None
 
 async def _pick_text_button(page, labels):
-    """Find a <button> whose visible text equals (trimmed) one of `labels`."""
+    """Find a <button> whose visible text equals (trimmed) one of `labels`.
+    Uses evaluate_handle so we get a real Playwright ElementHandle back
+    (plain page.evaluate serializes DOM nodes to non-clickable values)."""
     labels_l = [l.lower() for l in labels]
     js = "(labels) => { const bs=[...document.querySelectorAll('button')];" \
          " for (const b of bs){ const t=(b.innerText||'').trim().toLowerCase();" \
          " if (labels.includes(t) && b.offsetParent) return b; } return null; }"
-    return await page.evaluate(js, labels_l)
+    try:
+        return await page.evaluate_handle(js, labels_l)
+    except Exception:
+        return None
 
 async def _click_text_button(page, labels):
     b = await _pick_text_button(page, labels)
     if b:
-        await b.click(); await asyncio.sleep(1)
-    return bool(b)
+        try:
+            await b.click(); await asyncio.sleep(1)
+            return True
+        except Exception:
+            return False
+    return False
 
 
 async def _launch():
@@ -230,85 +239,157 @@ def _check_page(body):
     return None
 
 
+# Ported from gem.py: refuse to create/edit on the wrong account.
+# A wrong/extra signed-in account silently downgrades Pro → Flash in Gemini,
+# so we surface account count before touching the model picker. Detection scans
+# innerText/title/aria-label across all elements (the email can live in various
+# nodes). A CLEAR multi-account situation (>1) is a hard block; 0 is treated as
+# "could not detect" (soft warning) because the email is not always in the DOM.
+async def _check_accounts(page):
+    """Return list of @gmail.com accounts visible on the page."""
+    return await page.evaluate("""() => {
+        const o = [];
+        const regs = /^[\\w.+-]+@gmail\\.com$/;
+        document.querySelectorAll('*').forEach(e => {
+            const txt = (e.innerText || e.getAttribute('title') || e.getAttribute('aria-label') || '').trim();
+            // only leaf-ish text nodes (avoid matching huge containers)
+            if (regs.test(txt) && !o.includes(txt)) o.push(txt);
+        });
+        return o;
+    }""")
+
+
 # Locale-agnostic menuitem click: tries each candidate text substring.
+# Finds the menuitem via a JS innerText scan, then clicks it at its center
+# coordinates with page.mouse. This is the most reliable "trusted" click for
+# Google's custom GEM-MENU-ITEM elements: a JS .click() switches Extended
+# thinking but NOT the base model, while Playwright's element.click() hangs
+# waiting for the element to stop re-rendering (never "stable").
 async def _click_menuitem(page, candidates):
-    """Click first [role=menuitem] whose text includes one of `candidates`."""
+    """Click first [role=menuitem] whose innerText includes one of `candidates`."""
     for c in candidates:
         try:
-            item = await page.query_selector(f'[role="menuitem"]:has-text("{c}")')
-            if item:
-                await item.click(); await asyncio.sleep(1)
+            box = await page.evaluate("""(cand) => {
+                const sel = '[role=menuitem],[role=option],[role=menuitemradio],[role=menuitemcheckbox]';
+                const items = document.querySelectorAll(sel);
+                for (const it of items) {
+                    const t = (it.innerText || it.getAttribute('aria-label') || '').replace(/\\s+/g, ' ');
+                    if (t.includes(cand) && it.offsetParent) {
+                        const r = it.getBoundingClientRect();
+                        return {x: r.x + r.width/2, y: r.y + r.height/2};
+                    }
+                }
+                return null;
+            }""", c)
+            if box:
+                await page.mouse.click(box["x"], box["y"])
+                await asyncio.sleep(1)
                 _log(f"menuitem: {c}")
                 return c
-        except: pass
+        except Exception:
+            pass
     return None
 
 
 async def _select_model(page, model, thinking):
-    """Click model selector and pick model + thinking tier.
-    Locale-agnostic: tries zh-TW '模式選擇器', English 'model'/'mode' aria,
-    then a Pro/Flash text button. Extended thinking: zh-TW '延伸思考' / EN 'Extended thinking'."""
-    # Try to open the model selector
-    sel_btn = await _pick(page, [
+    """Click model selector and pick model + thinking tier, then VERIFY.
+    Locale-agnostic: tries zh-TW '模式選擇器', English 'Open mode picker',
+    then a Pro/Flash text button. Extended thinking: zh-TW '延伸思考' / EN
+    'Extended thinking'.
+    Borrowed from gem.py: Google's menu closes after each selection, so the
+    Extended-thinking click must REOPEN the picker. We also read back the
+    picker aria-label and retry (up to 4×) until both base model AND Extended
+    are confirmed — silent downgrade to Flash or dropping thinking is caught."""
+    MODEL_BTN = [
         'button[aria-label*="模式選擇器"]',
         'button[aria-label*="selector" i]',
         'button[aria-label*="model" i]',
         'button[aria-label*="mode" i]',
+        'button[aria-label*="picker" i]',
         'button:has-text("Pro")',
         'button:has-text("Flash")',
-    ])
-    clicked = False
-    if sel_btn:
+    ]
+
+    async def _picker_label():
         try:
-            await sel_btn.click(); await asyncio.sleep(1); clicked = True
-            _log("model selector clicked")
-        except: pass
-    if not clicked:
-        _log("model selector not found, skipping model selection")
-        return
-    await asyncio.sleep(1)
+            return await page.evaluate("""() => {
+                const b = document.querySelector('button[aria-label*="模式選擇器"]')
+                       || document.querySelector('button[aria-label*="picker" i]')
+                       || document.querySelector('button[aria-label*="selector" i]');
+                if (!b) return '';
+                return (b.getAttribute('aria-label') || '') + '|' + (b.innerText || '');
+            }""")
+        except Exception:
+            return ""
 
-    if model:
-        model_map = {
-            "flash-lite": ["3.1 Flash-Lite", "Flash-Lite"],
-            "flash": ["3.5 Flash", "Flash"],
-            "pro": ["3.1 Pro", "Pro"],
-            "pro-latest": ["3.1 Pro", "Pro"],
-        }
-        targets = model_map.get(model.lower(), [model])
-        for t in targets:
-            hit = await _click_menuitem(page, [t])
+    async def _menu_open():
+        """True if a model-menu menuitem is currently visible."""
+        try:
+            return await page.evaluate("""() => {
+                const its = document.querySelectorAll('[role=menuitem]');
+                for (const it of its) {
+                    const t = (it.innerText||'');
+                    if (/Pro|Flash|Extended thinking|延伸思考/.test(t) && it.offsetParent) return true;
+                }
+                return false;
+            }""")
+        except Exception:
+            return False
+
+    async def _ensure_open():
+        """Open the model menu if it isn't already open. Returns True if a
+        picker button was found."""
+        if await _menu_open():
+            return True
+        b = await _pick(page, MODEL_BTN)
+        if not b:
+            return False
+        try:
+            await b.click(); await asyncio.sleep(1.5)
+        except Exception:
+            pass
+        return True
+
+    model_map = {
+        "flash-lite": ["3.1 Flash-Lite", "Flash-Lite"],
+        "flash": ["3.5 Flash", "Flash"],
+        "pro": ["3.1 Pro", "Pro"],
+        "pro-latest": ["3.1 Pro", "Pro"],
+    }
+    base_label = model_map.get((model or "pro").lower(), [model])[0] if model else None
+    want_ext = bool(thinking) and thinking.lower() in ("extended", "extend")
+
+    # Select base model, then (optionally) Extended thinking. Google's menu
+    # closes after each selection, so we re-open before each click. Verify the
+    # picker label reflects the choice; retry (up to 4×) if not confirmed.
+    for attempt in range(4):
+        if not await _ensure_open():
+            _log("model selector not found"); break
+        if base_label:
+            hit = await _click_menuitem(page, [base_label] + model_map.get((model or "pro").lower(), [model]))
             if hit:
-                _log(f"base model: {t}")
-                break
-
-    if thinking and thinking.lower() in ("extended", "extend"):
-        # Google's menu closes after each selection, so we must REOPEN the
-        # selector before clicking Extended thinking (two-step flow).
-        await asyncio.sleep(1)
-        reopen = await _pick(page, [
-            'button[aria-label*="模式選擇器"]',
-            'button[aria-label*="selector" i]',
-            'button[aria-label*="model" i]',
-            'button[aria-label*="mode" i]',
-            'button:has-text("Pro")',
-            'button:has-text("Flash")',
-        ])
-        if reopen:
-            try:
-                await reopen.click(); await asyncio.sleep(1.5)
-                _log("model selector reopened for extended thinking")
-            except: pass
-        hit = await _click_menuitem(page, ["延伸思考", "Extended thinking"])
-        if hit:
-            _log("extended thinking: ON")
-        else:
-            _log("extended thinking menuitem not found")
-
+                _log(f"base model: {hit}")
+        await asyncio.sleep(1.0)
+        if want_ext:
+            if not await _ensure_open():
+                _log("model selector not found for extended"); break
+            hit = await _click_menuitem(page, ["延伸思考", "Extended thinking"])
+            if hit:
+                _log("extended thinking: ON")
+            else:
+                _log("extended thinking menuitem not found")
+            await asyncio.sleep(1.0)
+        label = await _picker_label()
+        has_base = (not base_label) or (base_label.split()[-1] in label)  # "Pro"/"Flash"/"Lite"
+        has_ext = (not want_ext) or ("Extended" in label)
+        if has_base and has_ext:
+            break
+        _log(f"model not confirmed (attempt {attempt+1}): label='{label[:60]}' — retrying")
+    _log(f"model label final: {(await _picker_label())[:80]}")
     try:
-        await page.keyboard.press("Escape")
-        await asyncio.sleep(0.5)
-    except: pass
+        await page.keyboard.press("Escape"); await asyncio.sleep(0.5)
+    except Exception:
+        pass
 
 
 # ─═════════════ CHAT ══════════════
@@ -370,9 +451,27 @@ async def cmd_create(name, instructions, knowledge_files=None, knowledge_code=No
     """Create a Gem with optional knowledge files, code repos, photos, folders."""
     pw, ctx, page = await _launch()
     try:
+        # SAFETY (ported from gem.py): require exactly one signed-in account.
+        # A wrong/extra account silently downgrades Pro → Flash in Gemini.
+        # Check on /gems/view — the account email reliably appears there
+        # (the create page itself does not surface it in the DOM).
+        await page.goto("https://gemini.google.com/gems/view", wait_until="domcontentloaded", timeout=30000)
+        await asyncio.sleep(4)
+        accts = await _check_accounts(page)
+        _log(f"accounts visible: {accts}")
+        if len(accts) > 1:
+            # Clear danger: multiple signed-in accounts → silent Pro→Flash
+            # downgrade risk. Refuse until the wrong one is logged out.
+            return _err("MULTI_ACCOUNT",
+                        f"expected exactly 1 gmail account, got {len(accts)} "
+                        f"({accts}). Log out the wrong one before creating a Gem.",
+                        accounts=accts)
+        if len(accts) == 0:
+            # Detection is unreliable (email not always in DOM). Warn, don't block.
+            _log("WARNING: could not detect account email — continuing (verify Pro is active)")
         _log("create: navigating to gems/create...")
         await page.goto("https://gemini.google.com/gems/create", wait_until="domcontentloaded", timeout=30000)
-        await asyncio.sleep(5)
+        await asyncio.sleep(8)
 
         ni = await _pick(page, [
             'input[aria-label="輸入 Gem 名稱"]',
@@ -537,6 +636,18 @@ async def cmd_edit(gem_id, name=None, instructions=None, knowledge_files=None,
     """Edit an existing Gem — change name, instructions, model, or add knowledge."""
     pw, ctx, page = await _launch()
     try:
+        # SAFETY (ported from gem.py): exactly one signed-in account required
+        # before touching the model picker (wrong account = silent Pro→Flash).
+        if model:
+            accts = await _check_accounts(page)
+            _log(f"accounts visible: {accts}")
+            if len(accts) > 1:
+                return _err("MULTI_ACCOUNT",
+                            f"expected exactly 1 gmail account, got {len(accts)} "
+                            f"({accts}). Log out the wrong one before editing model.",
+                            accounts=accts)
+            if len(accts) == 0:
+                _log("WARNING: could not detect account email — continuing (verify Pro is active)")
         edit_url = f"https://gemini.google.com/gems/edit/{gem_id}"
         _log(f"edit: navigating to {edit_url}")
         await page.goto(edit_url, wait_until="domcontentloaded", timeout=30000)

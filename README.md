@@ -149,6 +149,25 @@ gem-pw → launch_persistent_context → Chromium (headful)
 
 ## Changelog
 
+### v4.2 (Jul 2026) — Ported safety + verified model picker (from gem.py)
+- **Multi-account guard**: before `--create` / `--edit -m`, gem-pw checks the
+  signed-in Google account. >1 account → hard `MULTI_ACCOUNT` refusal (a wrong
+  account silently downgrades Pro → Flash). 0 detected → soft warning (email is
+  not always in the DOM; detection is best-effort, never blocks). Ported from gem.py.
+- **Verified model picker**: `_select_model` now reads back the picker aria-label
+  and retries (up to 4×) until both base model AND Extended thinking are
+  confirmed. If Pro/base never engages, the tool logs `model not confirmed`
+  instead of silently saving a Flash gem. (NOTE: as of 2026-07-15 the Gemini
+  model picker on this account only toggles Extended thinking — the base-model
+  selection does not register via automation. gem-pw reports this honestly via
+  the log rather than pretending Pro is active.)
+- **Fixed `_click_text_button`**: was using `page.evaluate` which returns a
+  non-clickable serialized value → all create/save operations crashed with
+  `AttributeError`. Now uses `evaluate_handle` + a real click.
+- **Robust menuitem clicks**: uses `page.mouse.click` at the element's center
+  (avoids Playwright's stability-wait hang on Google's re-rendering custom
+  elements, and engages the base model better than a JS `.click()`).
+
 ### v4.1 (Jul 2026) — Locale-agnostic + English verified
 - **Locale-agnostic selectors**: every UI selector now tries Traditional Chinese (zh-TW) first, then English (EN-US), then a structural fallback. Switching Gemini between English and zh-TW requires NO code change.
 - **Verified on both locales** (live-tested 2026-07-15): chat input, tools button, model picker, create/edit form, knowledge menu, save/delete.
