@@ -1,8 +1,17 @@
 # gem-pw — Gemini Gem CLI via Browser Automation
 
-AI-agent-native CLI for interacting with Gemini Gems through browser automation.
+AI-agent-native CLIs for interacting with Gemini Gems through browser automation.
 No API keys, no cookie extraction, no external server. Sign in once, then all
 commands work.
+
+Two tools ship in this repo:
+
+- **`gem.py`** (recommended) — consolidated driver that connects to a **running
+  CDP browser** (Hermes headed-Chromium server on port 9223). Subcommands:
+  `create | review | chat | upload | delete | img`. This is the maintained,
+  tested tool. See `SKILL.md` for full docs.
+- **`gem-pw`** (legacy) — launches its own persistent Chromium per call. Use when
+  no CDP server is available.
 
 ```
 gem-pw <gem-id> "prompt"                  → Chat
@@ -66,6 +75,39 @@ gem-pw --delete abc123
 gem-pw --upload 9d8c15f86f8b -f report.pdf "Summarize this"
 gem-pw --img 9d8c15f86f8b "A cat on a rainbow"
 ```
+
+## gem.py (CDP, consolidated) — recommended
+
+`gem.py` drives the **live, signed-in browser** over CDP (default
+`http://127.0.0.1:9223`). It does not launch its own browser. Subcommands:
+`create | review | chat | upload | delete | img`.
+
+```bash
+# Create a Gem (Pro+Extended by default; aborts if >1 Google account detected)
+python3 gem.py create --name "MyReviewer" --instructions instructions.txt --json
+
+# Continuous multi-round review (resumes thread via --conv)
+python3 gem.py review --gem <GEM_ID> --prompt round1.txt --out r1.md \
+  --conv conv.txt --cdp http://127.0.0.1:9223 source.py
+python3 gem.py review --gem <GEM_ID> --prompt round2.txt --out r2.md --conv conv.txt
+
+# Plain chat (also continuous with --conv)
+python3 gem.py chat --gem <GEM_ID> --prompt "Explain X" -o chat.md --conv chat_conv.txt
+
+# Upload a file then ask
+python3 gem.py upload --gem <GEM_ID> --file data.csv --prompt "Analyze" -o up.md
+
+# Image generation inside the Gem
+python3 gem.py img --gem <GEM_ID> --prompt "A double pendulum schematic" -o img.md
+
+# Delete
+python3 gem.py delete --gem <GEM_ID>
+```
+
+All subcommands accept `--json` (compact JSON pointer on STDOUT; full reply on
+disk), `-q` (quiet), and `--cdp` (override endpoint). See `SKILL.md` for the
+full reference and pitfalls.
+
 
 ## Output
 
