@@ -3,6 +3,12 @@
 gem-pw v4 — Self-contained Gemini Gem CLI. No external server needed.
 Launches Chromium per call, uses persistent profile for session.
 
+LOCALE NOTE (2026-07-15): Gemini's web UI renders in the account's
+language. This tool is locale-agnostic: every UI-string selector tries the
+Traditional Chinese (zh-TW) label first, then the English label, then a
+language-neutral structural selector. Switching Gemini between English and
+zh-TW (or vice versa) does NOT require changing this file.
+
 Commands:
   gem-pw <id> "prompt"                  Single-turn chat
   gem-pw <id> -c sess.json "prompt"     Multi-turn (persists conversation)
@@ -50,6 +56,48 @@ def _err(code, msg, **extra):
 def _ok(**kw): d = {"ok": True}; d.update(kw); return d
 
 
+# ───────────────────── LOCALE-AGNOSTIC SELECTORS ─────────────────────
+# Each helper tries candidate matchers in order and returns the first hit.
+# A matcher is either a CSS selector string (tried via query_selector) or a
+# callable taking `page` and returning an element handle / truthy.
+
+async def _pick(page, matchers):
+    """Return first non-None element handle across `matchers`.
+    matchers: list of CSS selector strings, or (css, js_text_check) tuples,
+    or async callables returning an element or None."""
+    for m in matchers:
+        try:
+            if callable(m):
+                el = await m(page)
+            elif isinstance(m, tuple):
+                css, js = m
+                el = await page.query_selector(css)
+                if el and js:
+                    ok = await page.evaluate(js, el)
+                    if not ok: el = None
+            else:
+                el = await page.query_selector(m)
+            if el:
+                return el
+        except Exception:
+            pass
+    return None
+
+async def _pick_text_button(page, labels):
+    """Find a <button> whose visible text equals (trimmed) one of `labels`."""
+    labels_l = [l.lower() for l in labels]
+    js = "(labels) => { const bs=[...document.querySelectorAll('button')];" \
+         " for (const b of bs){ const t=(b.innerText||'').trim().toLowerCase();" \
+         " if (labels.includes(t) && b.offsetParent) return b; } return null; }"
+    return await page.evaluate(js, labels_l)
+
+async def _click_text_button(page, labels):
+    b = await _pick_text_button(page, labels)
+    if b:
+        await b.click(); await asyncio.sleep(1)
+    return bool(b)
+
+
 async def _launch():
     """Launch Chromium with persistent profile. Returns (pw, ctx, page)."""
     from playwright.async_api import async_playwright, Error as PwError
@@ -80,12 +128,18 @@ async def _launch():
 
 
 async def _find_input(page, timeout=10):
-    """Find chat input element. Retries for `timeout` seconds."""
+    """Find chat input element. Retries for `timeout` seconds.
+    Locale-agnostic: zh-TW '輸入提示', English 'Enter a prompt for Gemini',
+    then structural fallbacks (rich-textarea / generic contenteditable)."""
     t0 = time.time()
     while time.time() - t0 < timeout:
-        el = await page.query_selector('div[role="textbox"][aria-label*="輸入提示"]')
-        if not el: el = await page.query_selector('rich-textarea div[contenteditable="true"]')
-        if not el: el = await page.query_selector('div[contenteditable="true"]:not(.ql-clipboard)')
+        el = await _pick(page, [
+            'div[role="textbox"][aria-label*="輸入提示"]',
+            'div[role="textbox"][aria-label*="prompt" i]',
+            'div[role="textbox"][aria-label*="Enter a prompt"]',
+            'rich-textarea div[contenteditable="true"]',
+            'div[contenteditable="true"]:not(.ql-clipboard)',
+        ])
         if el: return el
         await asyncio.sleep(1)
     return None
@@ -176,29 +230,42 @@ def _check_page(body):
     return None
 
 
+# Locale-agnostic menuitem click: tries each candidate text substring.
+async def _click_menuitem(page, candidates):
+    """Click first [role=menuitem] whose text includes one of `candidates`."""
+    for c in candidates:
+        try:
+            item = await page.query_selector(f'[role="menuitem"]:has-text("{c}")')
+            if item:
+                await item.click(); await asyncio.sleep(1)
+                _log(f"menuitem: {c}")
+                return c
+        except: pass
+    return None
+
+
 async def _select_model(page, model, thinking):
-    """Click model selector and pick model + thinking tier."""
-    selectors = [
+    """Click model selector and pick model + thinking tier.
+    Locale-agnostic: tries zh-TW '模式選擇器', English 'model'/'mode' aria,
+    then a Pro/Flash text button. Extended thinking: zh-TW '延伸思考' / EN 'Extended thinking'."""
+    # Try to open the model selector
+    sel_btn = await _pick(page, [
         'button[aria-label*="模式選擇器"]',
+        'button[aria-label*="selector" i]',
+        'button[aria-label*="model" i]',
+        'button[aria-label*="mode" i]',
         'button:has-text("Pro")',
         'button:has-text("Flash")',
-    ]
+    ])
     clicked = False
-    for sel in selectors:
+    if sel_btn:
         try:
-            btn = await page.query_selector(sel)
-            if btn:
-                await btn.click()
-                await asyncio.sleep(1)
-                clicked = True
-                _log(f"model selector clicked: {sel}")
-                break
+            await sel_btn.click(); await asyncio.sleep(1); clicked = True
+            _log("model selector clicked")
         except: pass
-
     if not clicked:
         _log("model selector not found, skipping model selection")
         return
-
     await asyncio.sleep(1)
 
     if model:
@@ -206,27 +273,37 @@ async def _select_model(page, model, thinking):
             "flash-lite": ["3.1 Flash-Lite", "Flash-Lite"],
             "flash": ["3.5 Flash", "Flash"],
             "pro": ["3.1 Pro", "Pro"],
+            "pro-latest": ["3.1 Pro", "Pro"],
         }
         targets = model_map.get(model.lower(), [model])
         for t in targets:
-            try:
-                item = await page.query_selector(f'[role="menuitem"]:has-text("{t}")')
-                if item:
-                    await item.click()
-                    await asyncio.sleep(1)
-                    _log(f"base model: {t}")
-                    break
-            except: pass
+            hit = await _click_menuitem(page, [t])
+            if hit:
+                _log(f"base model: {t}")
+                break
 
     if thinking and thinking.lower() in ("extended", "extend"):
-        await asyncio.sleep(0.5)
-        try:
-            ext_item = await page.query_selector('[role="menuitem"]:has-text("延伸思考")')
-            if ext_item:
-                await ext_item.click()
-                await asyncio.sleep(1)
-                _log("extended thinking: ON")
-        except: pass
+        # Google's menu closes after each selection, so we must REOPEN the
+        # selector before clicking Extended thinking (two-step flow).
+        await asyncio.sleep(1)
+        reopen = await _pick(page, [
+            'button[aria-label*="模式選擇器"]',
+            'button[aria-label*="selector" i]',
+            'button[aria-label*="model" i]',
+            'button[aria-label*="mode" i]',
+            'button:has-text("Pro")',
+            'button:has-text("Flash")',
+        ])
+        if reopen:
+            try:
+                await reopen.click(); await asyncio.sleep(1.5)
+                _log("model selector reopened for extended thinking")
+            except: pass
+        hit = await _click_menuitem(page, ["延伸思考", "Extended thinking"])
+        if hit:
+            _log("extended thinking: ON")
+        else:
+            _log("extended thinking menuitem not found")
 
     try:
         await page.keyboard.press("Escape")
@@ -234,7 +311,7 @@ async def _select_model(page, model, thinking):
     except: pass
 
 
-# ═══════════════ CHAT ═══════════════
+# ─═════════════ CHAT ══════════════
 
 async def cmd_chat(gem_id, prompt, conv_file=None, model=None, thinking=None, brief=False, output_path=None, timeout=120):
     if brief:
@@ -248,7 +325,7 @@ async def cmd_chat(gem_id, prompt, conv_file=None, model=None, thinking=None, br
                 conv_state = json.loads(cf.read_text())
                 old_url = conv_state.get("url","")
                 if old_url and "gemini.google.com" in old_url:
-                    _log(f"restoring conversation")
+                    _log("restoring conversation")
                     await page.goto(old_url, wait_until="domcontentloaded", timeout=30000)
                     await asyncio.sleep(6)
                 else:
@@ -286,7 +363,7 @@ async def cmd_chat(gem_id, prompt, conv_file=None, model=None, thinking=None, br
         await pw.stop()
 
 
-# ═══════════════ CREATE ═══════════════
+# ─═════════════ CREATE ┕═════════════
 
 async def cmd_create(name, instructions, knowledge_files=None, knowledge_code=None,
                      knowledge_photos=None, knowledge_folders=None, model=None, thinking=None):
@@ -297,13 +374,21 @@ async def cmd_create(name, instructions, knowledge_files=None, knowledge_code=No
         await page.goto("https://gemini.google.com/gems/create", wait_until="domcontentloaded", timeout=30000)
         await asyncio.sleep(5)
 
-        ni = await page.query_selector('input[aria-label="輸入 Gem 名稱"]')
-        if not ni: ni = await page.query_selector('input[placeholder="為 Gem 命名"]')
+        ni = await _pick(page, [
+            'input[aria-label="輸入 Gem 名稱"]',
+            'input[aria-label="Input for a Gem name" i]',
+            'input[placeholder="為 Gem 命名"]',
+            'input[placeholder*="name" i]',
+        ])
         if not ni: return _err("NO_NAME_INPUT", "Name input not found")
         await ni.click(); await asyncio.sleep(0.2); await ni.fill(name)
         _log(f"name: {name}")
 
-        ie = await page.query_selector('div[contenteditable="true"][aria-label="向 Gemini 輸入提示"]')
+        ie = await _pick(page, [
+            'div[contenteditable="true"][aria-label="向 Gemini 輸入提示"]',
+            'div[contenteditable="true"][aria-label*="prompt" i]',
+            'div[contenteditable="true"][aria-label*="Enter a prompt"]',
+        ])
         if not ie: return _err("NO_INST_INPUT", "Instructions input not found")
         await ie.click(); await asyncio.sleep(0.3)
         for i in range(0, len(instructions), 200):
@@ -312,16 +397,20 @@ async def cmd_create(name, instructions, knowledge_files=None, knowledge_code=No
         await asyncio.sleep(2)
 
         if model:
-            model_btn = await page.query_selector('button[aria-label*="模式選擇器"]')
+            model_btn = await _pick(page, [
+                'button[aria-label*="模式選擇器"]',
+                'button[aria-label*="selector" i]',
+                'button[aria-label*="model" i]',
+            ])
             if model_btn:
                 await model_btn.click(); await asyncio.sleep(3)
-                model_map = {"flash-lite": "3.1 Flash-Lite", "flash": "3.5 Flash", "pro": "3.1 Pro"}
+                model_map = {"flash-lite": "3.1 Flash-Lite", "flash": "3.5 Flash", "pro": "3.1 Pro", "pro-latest": "3.1 Pro"}
                 target = model_map.get(model.lower(), model)
                 await page.evaluate("(t) => { document.querySelectorAll('[role=menuitem]').forEach(i => { if ((i.innerText||'').includes(t)) i.click(); }); }", target)
                 await asyncio.sleep(2)
                 if thinking and thinking.lower() in ("extended", "extend"):
                     await model_btn.click(); await asyncio.sleep(4)
-                    await page.evaluate("() => { document.querySelectorAll('[role=menuitem]').forEach(i => { if ((i.innerText||'').includes('延伸思考')) i.click(); }); }")
+                    await page.evaluate("() => { document.querySelectorAll('[role=menuitem]').forEach(i => { if ((i.innerText||'').includes('延伸思考') || (i.innerText||'').includes('Extended thinking')) i.click(); }); }")
                     await asyncio.sleep(2)
                 _log(f"model: {model}" + ("+ext" if thinking else ""))
 
@@ -346,7 +435,14 @@ async def cmd_create(name, instructions, knowledge_files=None, knowledge_code=No
         all_files = (knowledge_files or []) + (knowledge_photos or [])
         if all_files or knowledge_code:
             _log("adding knowledge...")
-            kb_btn = await page.query_selector('button[aria-label*="知識部分"][aria-label*="上載"]')
+            kb_btn = await _pick(page, [
+                'button[aria-label*="知識部分"][aria-label*="上載"]',
+                'button[aria-label*="Knowledge"][aria-label*="Upload" i]',
+                'button[aria-label*="knowledge" i][aria-label*="upload" i]',
+                'button:has-text("新增檔案")',
+                'button:has-text("Add file")',
+                'button:has-text("Upload")',
+            ])
             if not kb_btn:
                 _log("WARNING: knowledge button not found")
             else:
@@ -354,7 +450,7 @@ async def cmd_create(name, instructions, knowledge_files=None, knowledge_code=No
                     fp = Path(fpath)
                     if not fp.exists(): _log(f"SKIP: {fp.name} not found"); continue
                     await kb_btn.click(); await asyncio.sleep(3)
-                    await page.evaluate("() => { document.querySelectorAll('[role=menuitem]').forEach(i => { if ((i.innerText||'').includes('上載檔案')) i.click(); }); }")
+                    await page.evaluate("() => { document.querySelectorAll('[role=menuitem]').forEach(i => { if ((i.innerText||'').includes('上載檔案') || (i.innerText||'').includes('Upload file')) i.click(); }); }")
                     await asyncio.sleep(2)
                     try:
                         async with page.expect_file_chooser(timeout=5000) as fc:
@@ -370,9 +466,10 @@ async def cmd_create(name, instructions, knowledge_files=None, knowledge_code=No
                     pp = Path(ppath)
                     if not pp.exists(): _log(f"SKIP: {pp.name} not found"); continue
                     await kb_btn.click(); await asyncio.sleep(3)
-                    await page.evaluate("() => { document.querySelectorAll('[role=menuitem]').forEach(i => { if ((i.innerText||'').trim() === '相片') i.click(); }); }")
+                    await page.evaluate("() => { document.querySelectorAll('[role=menuitem]').forEach(i => { if ((i.innerText||'').trim() === '相片' || (i.innerText||'').trim() === 'Photo') i.click(); }); }")
                     await asyncio.sleep(3)
                     dismiss = await page.query_selector('button:has-text("我明白了")')
+                    if not dismiss: dismiss = await page.query_selector('button:has-text("Got it")')
                     if dismiss: await dismiss.click(); await asyncio.sleep(1)
                     try:
                         async with page.expect_file_chooser(timeout=5000) as fc:
@@ -386,10 +483,11 @@ async def cmd_create(name, instructions, knowledge_files=None, knowledge_code=No
 
                 if knowledge_code:
                     await kb_btn.click(); await asyncio.sleep(3)
-                    await page.evaluate("() => { document.querySelectorAll('[role=menuitem]').forEach(i => { if ((i.innerText||'').includes('匯入程式碼')) i.click(); }); }")
+                    await page.evaluate("() => { document.querySelectorAll('[role=menuitem]').forEach(i => { if ((i.innerText||'').includes('匯入程式碼') || (i.innerText||'').includes('Import code')) i.click(); }); }")
                     await asyncio.sleep(3)
                     gh = await page.query_selector('input[aria-label*="GitHub"]')
                     if not gh: gh = await page.query_selector('input[placeholder*="github.com"]')
+                    if not gh: gh = await page.query_selector('input[placeholder*="github" i]')
                     if gh:
                         await gh.click(); await asyncio.sleep(0.3); await gh.fill(knowledge_code)
                         await asyncio.sleep(1)
@@ -400,11 +498,9 @@ async def cmd_create(name, instructions, knowledge_files=None, knowledge_code=No
                     else:
                         _log("WARNING: GitHub URL input not found")
 
-        sb = await page.query_selector('button:has-text("儲存")')
-        if not sb: sb = await page.query_selector('button:has-text("Save")')
+        saved = await _click_text_button(page, ["儲存", "Save", "更新", "Update"])
         gem_id = None
-        if sb:
-            await sb.click()
+        if saved:
             await asyncio.sleep(6)
             for _ in range(10):
                 for pg in ctx.pages:
@@ -433,7 +529,7 @@ async def cmd_create(name, instructions, knowledge_files=None, knowledge_code=No
         await pw.stop()
 
 
-# ═══════════════ EDIT ═══════════════
+# ─═════════════ EDIT ══════════════
 
 async def cmd_edit(gem_id, name=None, instructions=None, knowledge_files=None,
                    knowledge_code=None, knowledge_photos=None, knowledge_folders=None,
@@ -454,7 +550,8 @@ async def cmd_edit(gem_id, name=None, instructions=None, knowledge_files=None,
                 const btns = document.querySelectorAll('button');
                 for (const b of btns) {
                     const ar = (b.getAttribute('aria-label')||'').toLowerCase();
-                    if ((ar.includes('選項') || ar.includes('options')) && b.offsetParent) {
+                    if (((ar.includes('選項') || ar.includes('options')) && (ar.includes('gem') || b.offsetParent)) ||
+                        (ar.includes('more') && b.offsetParent)) {
                         b.click(); return 'ok';
                     }
                 }
@@ -473,8 +570,12 @@ async def cmd_edit(gem_id, name=None, instructions=None, knowledge_files=None,
         changed = []
 
         if name:
-            ni = await page.query_selector('input[aria-label="輸入 Gem 名稱"]')
-            if not ni: ni = await page.query_selector('input[placeholder="為 Gem 命名"]')
+            ni = await _pick(page, [
+                'input[aria-label="輸入 Gem 名稱"]',
+                'input[aria-label="Input for a Gem name" i]',
+                'input[placeholder="為 Gem 命名"]',
+                'input[placeholder*="name" i]',
+            ])
             if ni:
                 await ni.click(); await asyncio.sleep(0.2)
                 await ni.fill(""); await ni.fill(name)
@@ -482,7 +583,11 @@ async def cmd_edit(gem_id, name=None, instructions=None, knowledge_files=None,
                 changed.append("name")
 
         if instructions:
-            ie = await page.query_selector('div[contenteditable="true"][aria-label="向 Gemini 輸入提示"]')
+            ie = await _pick(page, [
+                'div[contenteditable="true"][aria-label="向 Gemini 輸入提示"]',
+                'div[contenteditable="true"][aria-label*="prompt" i]',
+                'div[contenteditable="true"][aria-label*="Enter a prompt"]',
+            ])
             if ie:
                 await ie.click(); await asyncio.sleep(0.3)
                 await page.keyboard.press("Control+a"); await asyncio.sleep(0.1)
@@ -493,16 +598,20 @@ async def cmd_edit(gem_id, name=None, instructions=None, knowledge_files=None,
                 changed.append("instructions")
 
         if model:
-            model_btn = await page.query_selector('button[aria-label*="模式選擇器"]')
+            model_btn = await _pick(page, [
+                'button[aria-label*="模式選擇器"]',
+                'button[aria-label*="selector" i]',
+                'button[aria-label*="model" i]',
+            ])
             if model_btn:
                 await model_btn.click(); await asyncio.sleep(3)
-                model_map = {"flash-lite": "3.1 Flash-Lite", "flash": "3.5 Flash", "pro": "3.1 Pro"}
+                model_map = {"flash-lite": "3.1 Flash-Lite", "flash": "3.5 Flash", "pro": "3.1 Pro", "pro-latest": "3.1 Pro"}
                 target = model_map.get(model.lower(), model)
                 await page.evaluate("(t) => { document.querySelectorAll('[role=menuitem]').forEach(i => { if ((i.innerText||'').includes(t)) i.click(); }); }", target)
                 await asyncio.sleep(2)
                 if thinking and thinking.lower() in ("extended", "extend"):
                     await model_btn.click(); await asyncio.sleep(4)
-                    await page.evaluate("() => { document.querySelectorAll('[role=menuitem]').forEach(i => { if ((i.innerText||'').includes('延伸思考')) i.click(); }); }")
+                    await page.evaluate("() => { document.querySelectorAll('[role=menuitem]').forEach(i => { if ((i.innerText||'').includes('延伸思考') || (i.innerText||'').includes('Extended thinking')) i.click(); }); }")
                     await asyncio.sleep(2)
                 _log(f"model: {model}" + ("+ext" if thinking else ""))
                 changed.append("model")
@@ -528,9 +637,14 @@ async def cmd_edit(gem_id, name=None, instructions=None, knowledge_files=None,
         all_files = (knowledge_files or []) + (knowledge_photos or [])
         if all_files or knowledge_code:
             _log("adding knowledge...")
-            kb_btn = await page.query_selector('button[aria-label*="知識部分"][aria-label*="上載"]')
-            if not kb_btn:
-                kb_btn = await page.query_selector('button:has-text("新增檔案")')
+            kb_btn = await _pick(page, [
+                'button[aria-label*="知識部分"][aria-label*="上載"]',
+                'button[aria-label*="Knowledge"][aria-label*="Upload" i]',
+                'button[aria-label*="knowledge" i][aria-label*="upload" i]',
+                'button:has-text("新增檔案")',
+                'button:has-text("Add file")',
+                'button:has-text("Upload")',
+            ])
             if not kb_btn:
                 _log("WARNING: knowledge button not found on edit page")
             else:
@@ -538,7 +652,7 @@ async def cmd_edit(gem_id, name=None, instructions=None, knowledge_files=None,
                     fp = Path(fpath)
                     if not fp.exists(): _log(f"SKIP: {fp.name} not found"); continue
                     await kb_btn.click(); await asyncio.sleep(3)
-                    await page.evaluate("() => { document.querySelectorAll('[role=menuitem]').forEach(i => { if ((i.innerText||'').includes('上載檔案')) i.click(); }); }")
+                    await page.evaluate("() => { document.querySelectorAll('[role=menuitem]').forEach(i => { if ((i.innerText||'').includes('上載檔案') || (i.innerText||'').includes('Upload file')) i.click(); }); }")
                     await asyncio.sleep(2)
                     try:
                         async with page.expect_file_chooser(timeout=5000) as fc:
@@ -555,9 +669,10 @@ async def cmd_edit(gem_id, name=None, instructions=None, knowledge_files=None,
                     pp = Path(ppath)
                     if not pp.exists(): _log(f"SKIP: {pp.name} not found"); continue
                     await kb_btn.click(); await asyncio.sleep(3)
-                    await page.evaluate("() => { document.querySelectorAll('[role=menuitem]').forEach(i => { if ((i.innerText||'').trim() === '相片') i.click(); }); }")
+                    await page.evaluate("() => { document.querySelectorAll('[role=menuitem]').forEach(i => { if ((i.innerText||'').trim() === '相片' || (i.innerText||'').trim() === 'Photo') i.click(); }); }")
                     await asyncio.sleep(3)
                     dismiss = await page.query_selector('button:has-text("我明白了")')
+                    if not dismiss: dismiss = await page.query_selector('button:has-text("Got it")')
                     if dismiss: await dismiss.click(); await asyncio.sleep(1)
                     try:
                         async with page.expect_file_chooser(timeout=5000) as fc:
@@ -572,10 +687,11 @@ async def cmd_edit(gem_id, name=None, instructions=None, knowledge_files=None,
 
                 if knowledge_code:
                     await kb_btn.click(); await asyncio.sleep(3)
-                    await page.evaluate("() => { document.querySelectorAll('[role=menuitem]').forEach(i => { if ((i.innerText||'').includes('匯入程式碼')) i.click(); }); }")
+                    await page.evaluate("() => { document.querySelectorAll('[role=menuitem]').forEach(i => { if ((i.innerText||'').includes('匯入程式碼') || (i.innerText||'').includes('Import code')) i.click(); }); }")
                     await asyncio.sleep(3)
                     gh = await page.query_selector('input[aria-label*="GitHub"]')
                     if not gh: gh = await page.query_selector('input[placeholder*="github.com"]')
+                    if not gh: gh = await page.query_selector('input[placeholder*="github" i]')
                     if gh:
                         await gh.click(); await asyncio.sleep(0.3); await gh.fill(knowledge_code)
                         await asyncio.sleep(1)
@@ -590,13 +706,8 @@ async def cmd_edit(gem_id, name=None, instructions=None, knowledge_files=None,
             _log("no changes specified")
             return _ok(action="edit-gem", id=gem_id, changed=[], note="no changes")
 
-        sb = await page.query_selector('button:has-text("儲存")')
-        if not sb: sb = await page.query_selector('button:has-text("Save")')
-        if not sb: sb = await page.query_selector('button:has-text("更新")')
-        if not sb: sb = await page.query_selector('button:has-text("Update")')
-
-        if sb:
-            await sb.click()
+        saved = await _click_text_button(page, ["儲存", "Save", "更新", "Update"])
+        if saved:
             await asyncio.sleep(5)
             _log(f"saved! changes: {changed}")
         else:
@@ -609,7 +720,7 @@ async def cmd_edit(gem_id, name=None, instructions=None, knowledge_files=None,
         await pw.stop()
 
 
-# ═══════════════ DELETE ═══════════════
+# ─═════════════ DELETE ══════════════
 
 async def cmd_delete(gem_id):
     pw, ctx, page = await _launch()
@@ -623,7 +734,8 @@ async def cmd_delete(gem_id):
             for (const b of btns) {
                 const ar = (b.getAttribute('aria-label')||'').toLowerCase();
                 const tx = (b.innerText||'').toLowerCase();
-                if ((ar.includes('gem') || ar.includes('選項') || ar.includes('options') || ar.includes('more')) &&
+                if (((ar.includes('gem') || ar.includes('選項') || ar.includes('options') || ar.includes('more')) &&
+                     (ar.includes('gem') || ar.includes('其他') || ar.includes('other'))) &&
                     b.offsetParent) {
                     b.click();
                     return 'clicked:' + ar.slice(0,40);
@@ -646,7 +758,7 @@ async def cmd_delete(gem_id):
             }
             const items = document.querySelectorAll('[role="menuitem"]');
             for (const item of items) {
-                if ((item.innerText||'').trim() === '刪除') { item.click(); return 'clicked:menuitem'; }
+                if ((item.innerText||'').trim() === '刪除' || (item.innerText||'').trim() === 'Delete') { item.click(); return 'clicked:menuitem'; }
             }
             return 'not-found';
         }""")
@@ -673,7 +785,7 @@ async def cmd_delete(gem_id):
         await pw.stop()
 
 
-# ═══════════════ UPLOAD ═══════════════
+# ─═════════════ UPLOAD ══════════════
 
 async def cmd_upload(gem_id, file_paths, prompt, out_path=None):
     if isinstance(file_paths, str): file_paths = [file_paths]
@@ -690,13 +802,17 @@ async def cmd_upload(gem_id, file_paths, prompt, out_path=None):
         err = _check_page(body)
         if err: return _err(err, body[:200])
 
-        tools = await page.query_selector('[aria-label="上載同工具"]')
+        tools = await _pick(page, [
+            '[aria-label="上載同工具"]',
+            '[aria-label*="Upload" i][aria-label*="tools" i]',
+            '[aria-label*="Upload & tools" i]',
+        ])
         if tools: await tools.click(); await asyncio.sleep(2)
 
         await page.evaluate("""() => {
             const items = document.querySelectorAll('toolbox-drawer-item, [role="menuitem"]');
             for (const item of items) {
-                if ((item.innerText||'').trim().startsWith('上載檔案')) { item.click(); return; }
+                if (((item.innerText||'').trim().startsWith('上載檔案')) || ((item.innerText||'').trim().startsWith('Upload file'))) { item.click(); return; }
             }
         }""")
         await asyncio.sleep(2)
@@ -717,7 +833,7 @@ async def cmd_upload(gem_id, file_paths, prompt, out_path=None):
         await pw.stop()
 
 
-# ═══════════════ IMAGE GEN ═══════════════
+# ─═════════════ IMAGE GEN ══════════════
 
 async def cmd_image(gem_id, description):
     pw, ctx, page = await _launch()
@@ -726,13 +842,17 @@ async def cmd_image(gem_id, description):
         await page.goto(f"https://gemini.google.com/gem/{gem_id}", wait_until="domcontentloaded", timeout=30000)
         await asyncio.sleep(5)
 
-        tools = await page.query_selector('[aria-label="上載同工具"]')
+        tools = await _pick(page, [
+            '[aria-label="上載同工具"]',
+            '[aria-label*="Upload" i][aria-label*="tools" i]',
+            '[aria-label*="Upload & tools" i]',
+        ])
         if tools: await tools.click(); await asyncio.sleep(2)
 
         clicked = await page.evaluate("""() => {
             const items = document.querySelectorAll('toolbox-drawer-item');
             for (const item of items) {
-                if ((item.innerText||'').trim().startsWith('製作圖像')) {
+                if (((item.innerText||'').trim().startsWith('製作圖像')) || ((item.innerText||'').trim().startsWith('Create image'))) {
                     item.click(); return 'ok';
                 }
             }
@@ -750,7 +870,7 @@ async def cmd_image(gem_id, description):
 
         _log("generating...")
         resp, elapsed = await _wait_response(page, timeout=60)
-        if "Creating" in resp:
+        if "Creating" in resp or "建立" in resp:
             _log("image still creating, waiting for render...")
             for _ in range(20):
                 await asyncio.sleep(3)
@@ -796,13 +916,13 @@ async def cmd_image(gem_id, description):
         await pw.stop()
 
 
-# ═══════════════ MAIN ═══════════════
+# ─═════════════ MAIN ══════════════
 
 async def main():
     global QUIET, JSON_OUT
     args = sys.argv[1:]
     if not args or args[0] in ("--help", "-h", "help"):
-        print(json.dumps({"ok": True, "help": "gem-pw v4 — Self-contained Gemini Gem CLI",
+        print(json.dumps({"ok": True, "help": "gem-pw v4 — Self-contained Gemini Gem CLI (locale-agnostic: zh-TW + English)",
             "commands": {
                 "chat": "gem-pw <id> \"prompt\" [-c sess.json] [-m model] [--thinking extended] [-o out.md] [-t seconds] [--brief] [--new] [--json-out] [-q]",
                 "create": "gem-pw --create \"Name\" \"Instructions\" [--knowledge-file <f>] [--knowledge-code <url>] [--knowledge-photo <img>] [--knowledge-folder <dir>] [-m model] [--thinking extended]",

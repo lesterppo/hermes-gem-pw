@@ -1,7 +1,7 @@
 ---
 name: gem-pw
 description: Browser-automated Gemini Gem CLI via Chromium CDP.
-version: 4.0.0
+version: 4.1.0
 author: lesterppo
 tags: [gemini, gem, cli, playwright, cdp, browser-automation]
 platforms: [linux, macos, wsl]

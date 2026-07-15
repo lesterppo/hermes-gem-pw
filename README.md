@@ -42,8 +42,8 @@ gem-pw-login  # Opens Chromium → sign into Gemini
 gem-pw 9d8c15f86f8b "Explain EBITDA in 2 sentences"
 
 # Multi-turn conversation
-gem-pw 9d8c15f86f8b -c /tmp/session.json "I am Peter"
-gem-pw 9d8c15f86f8b -c /tmp/session.json "What is my name?"
+gem-pw 9d8c15f86f8b -c /tmp/session.json "Remember that my favorite color is blue"
+gem-pw 9d8c15f86f8b -c /tmp/session.json "What is my favorite color?"
 
 # Model selection + extended thinking
 gem-pw 9d8c15f86f8b -m pro --thinking extended -t 600 "deep analysis"
@@ -106,6 +106,12 @@ gem-pw → launch_persistent_context → Chromium (headful)
 ```
 
 ## Changelog
+
+### v4.1 (Jul 2026) — Locale-agnostic + English verified
+- **Locale-agnostic selectors**: every UI selector now tries Traditional Chinese (zh-TW) first, then English (EN-US), then a structural fallback. Switching Gemini between English and zh-TW requires NO code change.
+- **Verified on both locales** (live-tested 2026-07-15): chat input, tools button, model picker, create/edit form, knowledge menu, save/delete.
+- **Fixed Pro + Extended Thinking**: Google's model menu closes after every selection, so the Extended-thinking click now reopens the menu first (two-step flow). Without this, `-m pro --thinking extended` silently left thinking off.
+- Privacy-safe: no hardcoded paths or personal identifiers; uses `Path.home()` / `$HOME` / `$HERMES_HOME`.
 
 ### v4 (Jul 2026)
 - `--edit` command: edit existing Gems (name, instructions, model, knowledge)

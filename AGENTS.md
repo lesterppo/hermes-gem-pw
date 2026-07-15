@@ -76,9 +76,9 @@ The JSON is ~100 chars — intentionally token-efficient for agent consumption.
 
 Use `-c <session.json>` to persist conversation across turns:
 ```bash
-gem-pw <id> -c /tmp/session.json "I am Peter"
-gem-pw <id> -c /tmp/session.json "What is my name?"
-# Second call restores the conversation — Gem remembers "Peter"
+gem-pw <id> -c /tmp/session.json "Remember that my favorite color is blue"
+gem-pw <id> -c /tmp/session.json "What is my favorite color?"
+# Second call restores the conversation — Gem remembers the prior context
 ```
 
 ## Gem Knowledge Management
