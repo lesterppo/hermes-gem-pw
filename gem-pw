@@ -40,6 +40,28 @@ from pathlib import Path
 try: signal.signal(signal.SIGPIPE, signal.SIG_DFL)
 except: pass
 
+# ── Headless fallback: virtual display via xvfb-run ───────────────────────
+# gem-pw launches a HEADED Chromium (headless=False) on purpose — headed mode
+# is what slips past Google's anti-automation. But a headed browser needs an X
+# server. On a headless box (cron, SSH, remote) there is no DISPLAY, so Chromium
+# would fail to start. Fallback: if DISPLAY is unset and xvfb-run exists,
+# transparently re-exec THIS process under `xvfb-run -a` so Chromium gets a
+# throwaway virtual display — still headed (anti-detection preserved), just not
+# a real one. Gated by GEM_PW_XVFB (default auto; set to 0 to disable). A
+# sentinel env var prevents infinite re-exec loops.
+import shutil as _shutil
+if (not os.environ.get("DISPLAY")
+        and os.environ.get("GEM_PW_XVFB", "1") != "0"
+        and not os.environ.get("_GEM_PW_XVFB_WRAPPED")
+        and _shutil.which("xvfb-run")):
+    os.environ["_GEM_PW_XVFB_WRAPPED"] = "1"
+    _xvfb = [_shutil.which("xvfb-run"), "-a", sys.executable] + sys.argv
+    try:
+        os.execvp(_xvfb[0], _xvfb)
+    except Exception as _e:
+        # If re-exec fails for any reason, fall through and let the normal
+        # launch path surface a clear NO_DISPLAY error instead of crashing here.
+        sys.stderr.write(f"[gem-pw] xvfb-run re-exec failed ({_e}); continuing without it\n")
 PROFILE = str(Path.home() / ".gemini-cli" / "cr-profile")
 # Profile-aware output dir: defaults under ~/.hermes/gem_pw_output, overridable
 # via GEM_PW_OUTPUT_DIR so isolated HERMES_HOMEs don't collide on /tmp.

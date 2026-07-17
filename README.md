@@ -1,34 +1,39 @@
 # gem-pw — Gemini Gem CLI via Browser Automation
 
-AI-agent-native CLIs for interacting with Gemini Gems through browser automation.
-No API keys, no cookie extraction, no external server. Sign in once, then all
-commands work.
+AI-agent-native CLI for interacting with **Gemini Gems** through browser
+automation. No API keys, no cookie extraction, no external server. Sign in
+once, then all commands work.
 
-Two tools ship in this repo:
+> **One tool, not two.** This repo ships a single self-contained CLI: **`gem-pw`**.
+> It contains the full consolidated feature set (chat, create, edit, delete,
+> upload, image, **and `--collab`** — the token-efficient surgical-diff protocol).
+> An older `gem.py` existed historically but is now superseded by `gem-pw` and is
+> **no longer in this repo**. Do not look for it.
 
-- **`gem.py`** (recommended) — consolidated driver that connects to a **running
-  CDP browser** (Hermes headed-Chromium server on port 9223). Subcommands:
-  `create | review | chat | upload | delete | img`. This is the maintained,
-  tested tool. See `SKILL.md` for full docs.
-- **`gem-pw`** (legacy) — launches its own persistent Chromium per call. Use when
-  no CDP server is available.
-
-```
-gem-pw <gem-id> "prompt"                  → Chat
-gem-pw <gem-id> -c sess.json "prompt"     → Multi-turn
+```text
+gem-pw <gem-id> "prompt"                  → Chat (single turn)
+gem-pw <gem-id> -c sess.json "prompt"     → Multi-turn (persists conversation)
+gem-pw --collab <gem-id> -f file "instr"  → Request a UNIFIED DIFF only (token-efficient)
 gem-pw --create "Name" "Instructions"      → Create Gem
 gem-pw --edit <gem-id> --name "New"        → Edit Gem
 gem-pw --delete <gem-id>                   → Delete Gem
 gem-pw --upload <gem-id> -f file "Q"       → Upload + ask
 gem-pw --img <gem-id> "description"        → Generate image
-gem-pw --help                              → Help
+gem-pw --help                              → Full help (JSON)
 ```
 
 ## Why
 
-gemini-webapi's internal RPC API returns UNAUTHENTICATED for Gem operations
-(as of July 2026). gem-pw bypasses this by driving the real Gemini web UI
-through a headful Chromium browser via Playwright.
+`gemini-webapi`'s internal RPC API returns **UNAUTHENTICATED** for Gem
+operations (as of July 2026). `gem-pw` bypasses this by driving the real
+Gemini web UI through a **headless/headed Chromium** browser via Playwright.
+
+A **Gem is a UI construct** — its bundled instruction + knowledge are NOT
+exposed by the raw Gemini API, so the Gemini Interactions API /
+`GEMINI_API_KEY` **cannot target a specific Gem**. The ONLY working backend is
+`gem-pw` (browser). Do not build or claim an API fallback that would silently
+ignore the Gem. (This is why the Hermes-native `gem_collab`/`gem_chat` tools
+are gem-pw-only — see "For Hermes Agents" below.)
 
 ## Install
 
@@ -38,11 +43,19 @@ cd hermes-gem-pw
 bash install.sh
 ```
 
-## Setup
+`install.sh` installs `playwright`/`aiohttp`, downloads Chromium, and copies
+`gem-pw` + `gem-pw-login` to `~/.local/bin/`.
+
+## Setup (one-time)
 
 ```bash
-gem-pw-login  # Opens Chromium → sign into Gemini
+gem-pw-login   # Opens Chromium → sign into Gemini (needs an X display)
 ```
+
+`gem-pw` is **CDP-first**: if a running headed Chromium page server is alive on
+`http://127.0.0.1:9223` (e.g. the Hermes `hermes_cdp_server.py` / `cr-server`),
+it connects to that warm browser (multi-turn, no cold-start). Otherwise it
+launches its own headed Chromium (profile at `~/.gemini-cli/cr-profile/`).
 
 ## Usage
 
@@ -64,122 +77,135 @@ gem-pw --create "Analyzer" "Analyze code" \
   --knowledge-code https://github.com/user/repo \
   --knowledge-folder /path/to/project
 
-# Edit a Gem
+# Edit / Delete / Upload / Image
 gem-pw --edit <id> --name "New Name"
-gem-pw --edit <id> --instructions "New system prompt..."
-gem-pw --edit <id> --knowledge-code https://github.com/user/repo
-gem-pw --edit <id> -m pro --thinking extended
-
-# Delete / Upload / Image
 gem-pw --delete abc123
 gem-pw --upload 9d8c15f86f8b -f report.pdf "Summarize this"
 gem-pw --img 9d8c15f86f8b "A cat on a rainbow"
 ```
 
-## gem.py (CDP, consolidated) — recommended
+### `--collab` — the token-efficient diff protocol
 
-`gem.py` drives the **live, signed-in browser** over CDP (default
-`http://127.0.0.1:9223`). It does not launch its own browser. Subcommands:
-`create | review | chat | upload | delete | img`.
+Instead of re-emitting the whole file every turn, `--collab` asks the Gem to
+return a **unified diff only**. This cuts later-round token cost dramatically.
 
 ```bash
-# Create a Gem (Pro+Extended by default; aborts if >1 Google account detected)
-python3 gem.py create --name "MyReviewer" --instructions instructions.txt --json
-
-# Continuous multi-round review (resumes thread via --conv)
-python3 gem.py review --gem <GEM_ID> --prompt round1.txt --out r1.md \
-  --conv conv.txt --cdp http://127.0.0.1:9223 source.py
-python3 gem.py review --gem <GEM_ID> --prompt round2.txt --out r2.md --conv conv.txt
-
-# Plain chat (also continuous with --conv)
-python3 gem.py chat --gem <GEM_ID> --prompt "Explain X" -o chat.md --conv chat_conv.txt
-
-# Upload a file then ask
-python3 gem.py upload --gem <GEM_ID> --file data.csv --prompt "Analyze" -o up.md
-
-# Image generation inside the Gem
-python3 gem.py img --gem <GEM_ID> --prompt "A double pendulum schematic" -o img.md
-
-# Delete
-python3 gem.py delete --gem <GEM_ID>
+gem-pw --collab <gem-id> -f current.py "Add a retry() helper" -o resp.md -t 300
+# Gem returns a diff block:  --- a/current.py / +++ b/current.py / @@ ...
+python3 apply_gem_diff.py resp.md current.py           # apply it
+python3 apply_gem_diff.py resp.md current.py --dry      # preview only
 ```
 
-All subcommands accept `--json` (compact JSON pointer on STDOUT; full reply on
-disk), `-q` (quiet), and `--cdp` (override endpoint). See `SKILL.md` for the
-full reference and pitfalls.
+`apply_gem_diff.py` (ships in this repo) extracts the **first** diff block from
+the Gem's response (ignoring any off-protocol prose the model appends), runs a
+`patch -p0 --dry-run`, and applies it. It **rejects empty / whitespace-only
+diffs** (`EMPTY_DIFF`) so a no-op never reports success.
 
+**Protocol rule (verified):** the `--collab` prompt MUST force the exact
+uploaded filename as the diff header (`--- a/<name>` / `+++ b/<name>`) and at
+least one real added/removed line. A knowledge/persona Gem (e.g. a
+paper-knowledge Gem) follows the protocol less tightly and may append an essay
+after the diff — `apply_gem_diff.py` ignores the trailing prose, but prefer a
+**dedicated coding Gem** for cleanest results.
+
+## For Hermes Agents
+
+This tool is built for AI-agent consumption:
+
+- **Token-efficient**: ~100-char JSON pointer on STDOUT; full reply on disk.
+- **Self-describing errors**: error codes tell the agent what to do next.
+- **File-based I/O**: responses on disk, pointer JSON on stdout.
+- **Multi-turn**: `-c session.json` persists conversation across agent turns.
+- **Headless fallback**: if `DISPLAY` is unset and `xvfb-run` exists, gem-pw
+  transparently re-execs under `xvfb-run -a` (still headed mode, anti-detection
+  preserved). Set `GEM_PW_XVFB=0` to disable. This makes cron/remote use work
+  with zero config.
+
+### Native Hermes tool (recommended integration)
+
+To expose Gem collaboration directly as Hermes model tools, drop two files into
+a Hermes agent checkout and enable the toolset:
+
+1. Copy `gem_tool.py` → `<hermes-agent>/tools/gem_tool.py`
+2. Copy `apply_gem_diff.py` → `<hermes-agent>/tools/apply_gem_diff.py` (or keep
+   it at `~/.hermes/scripts/apply_gem_diff.py` and point the tool at it)
+3. Add `"gem"` to `CONFIGURABLE_TOOLSETS` in `hermes_cli/tools_config.py` (or
+   rely on the auto-enable: the `gem` toolset auto-appears when `gem-pw` is on
+   PATH — see the resolver's `_gem_pw_present()` auto-enable, mirroring the
+   `x_search` / `homeassistant` convention).
+4. The `gem` toolset provides two agent-native tools:
+   - **`gem_collab`** — `gem-pw --collab` + optional auto-apply. Args:
+     `gem_id`, `file_path`, `instruction`, `apply` (bool), `timeout`.
+   - **`gem_chat`** — `gem-pw` single/multi-turn chat. Args: `gem_id`,
+     `message`, `session_file`, `model`, `thinking`, `timeout`.
+
+Both return the same pointer JSON `{ok, f, s, t}` and write the full Gem reply
+to disk. They are **gem-pw-only** (no API fallback) for the UI-construct reason
+above.
 
 ## Output
 
 All commands return compact JSON on stdout. Response saved to file.
 
 ```json
-{"ok": true, "f": "/tmp/gem-pw-1783463794.md", "s": 16, "t": 11.7}
+{"ok": true, "f": "/home/USER/.hermes/gem_pw_output/gem-pw-1783463794.md", "s": 16, "t": 11.7}
 ```
 
-## For Hermes Agents
-
-This tool is built for AI agent consumption. Key properties:
-
-- **Token-efficient**: ~100 char JSON stdout (~25 tokens)
-- **Self-describing errors**: Error codes tell the agent what to do next
-- **Multi-turn**: `-c session.json` persists conversation across agent turns
-- **File-based I/O**: Responses on disk, pointer JSON on stdout
-- **Stateless**: Each call launches its own browser, no server to manage
-- **Gem CRUD**: Create, edit, delete Gems with knowledge management
-- **Configurable timeout**: `-t 600` for Pro+Extended Thinking with large knowledge
-
-Read `AGENTS.md` for the full agent integration guide.
+Output directory is profile-aware: `$HERMES_HOME/gem_pw_output/` when
+`HERMES_HOME` is set, else `~/.hermes/gem_pw_output/`. Override with
+`GEM_PW_OUTPUT_DIR` or `-o <file>`.
 
 ## Requirements
 
 - Python 3.10+
-- Playwright + Chromium
+- Playwright + Chromium (`playwright install chromium`)
 - aiohttp
-- X display (for Chromium window during login)
+- An X display for headed login (or `xvfb-run` for headless fallback)
 
 ## How It Works
 
-```
-gem-pw → launch_persistent_context → Chromium (headful)
-         └─ uses ~/.gemini-cli/cr-profile/
+```text
+gem-pw → (CDP if 9223 alive) else launch_persistent_context → Chromium (headed)
+         └─ uses ~/.gemini-cli/cr-profile/  (or $HERMES_HOME/.gemini-cli/cr-profile/)
          └─ profile persists session across calls
          └─ page.evaluate() for custom element interaction
 ```
 
 ## Changelog
 
-### v4.2 (Jul 2026) — Ported safety + verified model picker (from gem.py)
-- **Multi-account guard**: before `--create` / `--edit -m`, gem-pw checks the
-  signed-in Google account. >1 account → hard `MULTI_ACCOUNT` refusal (a wrong
-  account silently downgrades Pro → Flash). 0 detected → soft warning (email is
-  not always in the DOM; detection is best-effort, never blocks). Ported from gem.py.
-- **Verified model picker**: `_select_model` now reads back the picker aria-label
-  and retries (up to 4×) until both base model AND Extended thinking are
-  confirmed. If Pro/base never engages, the tool logs `model not confirmed`
-  instead of silently saving a Flash gem. (NOTE: when the account's Flash/Pro
-  quota is exhausted, Gemini only offers Flash-Lite as the selectable base
-  model — so Pro/Flash selection cannot engage via automation in that state.
-  This is a quota limitation, not a code bug. gem-pw reports it honestly via
-  the log rather than pretending Pro is active. Leave as-is.)
-- **Fixed `_click_text_button`**: was using `page.evaluate` which returns a
-  non-clickable serialized value → all create/save operations crashed with
-  `AttributeError`. Now uses `evaluate_handle` + a real click.
-- **Robust menuitem clicks**: uses `page.mouse.click` at the element's center
-  (avoids Playwright's stability-wait hang on Google's re-rendering custom
-  elements, and engages the base model better than a JS `.click()`).
+### v4.3 (Jul 2026) — xvfb fallback + native Hermes tool
+- **Headless fallback**: when `DISPLAY` is unset and `xvfb-run` exists, re-exec
+  under `xvfb-run -a` (headed Chromium on a virtual display). Gated by
+  `GEM_PW_XVFB` (default auto; `0` disables). Sentinel env var prevents re-exec
+  loops. Enables cron/remote use with zero config.
+- **`--collab` strict protocol**: prompt now forces the exact uploaded filename
+  as the diff header + real content (no empty diffs).
+- **Native Hermes tool** `gem_tool.py` (`gem_collab` + `gem_chat`) + the `gem`
+  toolset (auto-enabled when gem-pw is on PATH). `apply_gem_diff.py` rejects
+  empty/whitespace-only diffs and no longer crashes with SameFileError.
+
+### v4.2 (Jul 2026) — Ported safety + verified model picker
+- Multi-account guard before `--create`/`--edit -m` (refuses >1 signed-in
+  account to avoid silent Pro→Flash downgrade).
+- Verified model picker: retries until Pro + Extended confirmed; logs
+  `model not confirmed` if the account's quota only offers Flash-Lite.
+- Fixed `_click_text_button` crash (evaluate → evaluate_handle + real click).
 
 ### v4.1 (Jul 2026) — Locale-agnostic + English verified
-- **Locale-agnostic selectors**: every UI selector now tries Traditional Chinese (zh-TW) first, then English (EN-US), then a structural fallback. Switching Gemini between English and zh-TW requires NO code change.
-- **Verified on both locales** (live-tested 2026-07-15): chat input, tools button, model picker, create/edit form, knowledge menu, save/delete.
-- **Fixed Pro + Extended Thinking**: Google's model menu closes after every selection, so the Extended-thinking click now reopens the menu first (two-step flow). Without this, `-m pro --thinking extended` silently left thinking off.
-- Privacy-safe: no hardcoded paths or personal identifiers; uses `Path.home()` / `$HOME` / `$HERMES_HOME`.
+- Selectors try zh-TW → English → structural fallback. No code change needed to
+  switch Gemini language.
+- Pro + Extended Thinking: reopens the model menu before the Extended-thinking
+  click (Google closes the menu after every selection).
 
 ### v4 (Jul 2026)
-- `--edit` command: edit existing Gems (name, instructions, model, knowledge)
-- `-t` flag: configurable response timeout (default 120s, max 600s)
-- `--help`: fixed TypeError crash, now returns JSON help output
-- `-o` flag: specify output file path (previously was auto-named)
+- `--edit`, `-t` (timeout), `--help` (JSON), `-o` (output path).
+
+## Privacy
+
+This repo contains **no API keys, tokens, cookies, or personal identifiers**.
+All paths use `Path.home()` / `$HOME` / `$HERMES_HOME`. The browser profile it
+creates at runtime holds YOUR Gemini session — that profile is git-ignored and
+must never be committed.
 
 ## License
 

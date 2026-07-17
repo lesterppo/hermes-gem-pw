@@ -4,3 +4,10 @@ __pycache__/
 .DS_Store
 *.swp
 *.swo
+
+# Runtime browser profile (holds user Gemini session - NEVER commit)
+.gemini-cli/
+cr-profile/
+*.json
+!SKILL.md
+!package.json

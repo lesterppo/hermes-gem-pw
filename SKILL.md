@@ -1,194 +1,163 @@
 ---
 name: gem-pw
-description: Browser-automated Gemini Gem driver (CDP) with create, review, chat, upload, delete, img.
-version: 5.0.0
-author: lesterppo
+description: Browser-automated Gemini Gem driver (CDP-first) with chat, create, edit, delete, upload, img, and --collab surgical-diff review.
+version: 4.3.0
+author: Peter (lesterppo)
 tags: [gemini, gem, cli, playwright, cdp, browser-automation]
 platforms: [linux, macos, wsl]
 metadata:
   hermes:
     category: automation
-    related_skills: [browser-cdp, gem-cli]
+    related_skills: [gem-collab, browser-cdp, gem-cli]
     config:
       gem_cdp_endpoint: "http://127.0.0.1:9223"
-      gem_output: "/tmp"
+      gem_pw_output_dir: "$HERMES_HOME/gem_pw_output"
 ---
 
-# gem-pw — Gemini Gem driver via live CDP browser
+# gem-pw — Gemini Gem driver via browser automation
 
-Single agent-native CLI for driving Gemini Gems through the live, signed-in
-browser that is already running on the host. No API keys, no cookie
-extraction, no launcher. It connects to the browser's Chrome DevTools Protocol
-(CDP) endpoint and drives the real Gemini web UI.
+Single agent-native CLI for driving Gemini Gems through a live / launched
+Chromium browser. No API keys, no cookie extraction, no launcher. It is
+**CDP-first**: connects to a running headed Chromium page server (default
+`http://127.0.0.1:9223`) when one is alive, and falls back to launching its own
+headed Chromium (profile at `~/.gemini-cli/cr-profile/`) only when CDP is
+unavailable. This bypasses `gemini-webapi`'s broken RPC auth by driving the
+real Gemini web UI.
 
-Two front-ends share the same backend ideas:
-
-- **`gem.py`** (recommended) — connects to a running CDP browser on port 9223
-  (the Hermes-headed-Chromium server). Subcommands: `create | review | chat |
-  upload | delete | img`. This is the consolidated, tested tool.
-- **`gem-pw`** (legacy) — launches its own persistent Chromium per call. Useful
-  when no CDP server is available.
+> One tool, not two. This repo ships only `gem-pw` (fully consolidated: chat,
+> create, edit, delete, upload, img, **and `--collab`**). The older `gem.py` is
+> superseded and not in the repo.
 
 ## When to Use
 
 - Need to interact with a shared Gemini Gem via URL/id.
-- gemini-webapi returns UNAUTHENTICATED for Gem operations (Jul 2026).
+- `gemini-webapi` returns UNAUTHENTICATED for Gem operations (Jul 2026).
 - Need file upload, image generation, or multi-round review via the Gem web UI.
 - Need Pro + Extended Thinking with conversation continuity.
+- Need **token-efficient code/design iteration** via `--collab` surgical diffs.
 - Need Gem CRUD (create, edit, delete).
 
-## Prerequisites (gem.py)
+## Prerequisites
 
-1. A CDP-capable browser is running with remote debugging.
-   - **Hermes headed Chromium server:** port **9223** (default).
-   - **Windows Chrome (alternative):** port **9222**, launched with
-     `--remote-debugging-port=9222`. Reachable from WSL only after ADMIN
-     PowerShell `netsh interface portproxy` + a `New-NetFirewallRule` for 9222.
-2. The browser is signed into a Google account with **Gemini Advanced**, so the
-   model picker offers **3.1 Pro + Extended thinking**. An account without
-   Gemini Advanced silently downgrades a "Pro" review to Flash and invalidates
-   it — verify the picker label before reviewing.
-3. Python + Playwright: `pip install playwright && playwright install chromium`.
-4. `browser.allow_private_urls: true` is NOT required (we use `connect_over_cdp`,
-   not raw `Page.navigate`).
+1. Python 3.10+ and `pip install playwright aiohttp && playwright install chromium`.
+2. A Gemini session: run `gem-pw-login` once (opens Chromium → sign in). The
+   profile persists at `~/.gemini-cli/cr-profile/` (or
+   `$HERMES_HOME/.gemini-cli/cr-profile/`).
+3. For the prioritized CDP path, a headed Chromium page server must be alive:
+   `cr-server start --headed` (or `hermes_cdp_server.py`) on port **9223**.
+   Without it, gem-pw falls back to its own headed Chromium (needs an X display,
+   or `xvfb-run` — see Pitfalls).
+4. A Gemini Advanced (Pro+Extended) account is required for Pro/Extended — a
+   non-Advanced account silently downgrades Pro→Flash.
 
-## How to Run (gem.py)
+## How to Run
 
-Global flags `--cdp` (default `http://127.0.0.1:9223`), `--json` (compact JSON
-to STDOUT), and `-q` (quiet STDERR) may appear before or after the subcommand.
-Pass `--json` when driven by an agent — the full Gem reply is always written to
-a file on disk; STDOUT only carries the pointer.
+Global flags `--cdp` (default `http://127.0.0.1:9223`), `--no-cdp` (force own
+browser), `--json-out` (compact JSON to STDOUT), `-o <file>` (output path),
+`-t <seconds>` (timeout, default 120, max 600), `--brief`, `--new` may appear
+before or after the subcommand. Pass `--json-out` when driven by an agent.
 
-### 1. Create the Gem (one time) under the correct account
-
-`gem.py create` aborts if more than one Google account is detected (so you never
-create the Gem under the wrong account), selects **3.1 Pro + Extended thinking**
-by default, saves, and prints `GEM_ID=...`. Optional `--knowledge-file` /
-`--knowledge-folder` attach knowledge.
+### 1. Chat / multi-turn
 
 ```bash
-python3 gem.py create \
-  --name "Double Pendulum Sim Designer" \
-  --instructions /path/to/instructions.txt \
-  --cdp http://127.0.0.1:9223            # or --json for agent parsing
+gem-pw <gem-id> "prompt"
+gem-pw <gem-id> -c /tmp/sess.json "prompt"     # persists conversation
+gem-pw <gem-id> -m pro --thinking extended -t 600 "deep analysis"
 ```
 
-### 2. Run the review (continuous conversation)
-
-`gem.py review` attaches file(s) + a prompt, sends, waits for the Gem's reply,
-writes it to `--out`, and **persists the conversation URL to `--conv`**. On the
-next call, if `--conv` exists, it *resumes the same thread* (continuous context)
-— the key to a valid multi-round review.
+### 2. `--collab` — surgical-diff iteration (preferred for code/design)
 
 ```bash
-# Round 1 (new conversation)
-python3 gem.py review \
-  --gem <GEM_ID> --prompt /path/to/round1.txt --out /tmp/review_r1.md \
-  --conv /tmp/conv_url.txt --cdp http://127.0.0.1:9223 \
-  /path/to/source.py /path/to/diagram.png
-
-# Round 2+ (resume same conversation — do NOT change --conv path)
-python3 gem.py review \
-  --gem <GEM_ID> --prompt /path/to/round2.txt --out /tmp/review_r2.md \
-  --conv /tmp/conv_url.txt --cdp http://127.0.0.1:9223 \
-  /path/to/source.py
+gem-pw --collab <gem-id> -f current.py "Add a retry() helper" -o resp.md -t 300
+python3 apply_gem_diff.py resp.md current.py            # apply
+python3 apply_gem_diff.py resp.md current.py --dry      # preview
 ```
 
-Run each call in the background with `notify_on_complete=true` (Gem Pro+Extended
-can take several minutes; foreground caps at 600s).
+The Gem returns a UNIFIED DIFF only. `apply_gem_diff.py` extracts the first
+diff block, dry-runs `patch -p0`, and applies. **Never pass `-m/--thinking` at
+collab time** unless overriding — it can silently downgrade Pro→Flash.
 
-### 3. Other commands
+### 3. Gem CRUD
 
 ```bash
-# Upload a file then ask the Gem (single turn)
-python3 gem.py upload \
-  --gem <GEM_ID> --file /path/to/data.csv --prompt "Summarize this" -o /tmp/up.md
-
-# Plain chat (continuous with --conv)
-python3 gem.py chat --gem <GEM_ID> --prompt "Explain X" -o /tmp/c.md --conv /tmp/c_conv.txt
-
-# Delete a Gem
-python3 gem.py delete --gem <GEM_ID>
-
-# Generate an image inside the Gem
-python3 gem.py img --gem <GEM_ID> --prompt "A schematic of a double pendulum" -o /tmp/img.md
+gem-pw --create "Name" "Instructions" -m pro --thinking extended
+gem-pw --create "Analyzer" "Analyze code" --knowledge-file paper.pdf \
+  --knowledge-code https://github.com/user/repo --knowledge-folder /path/to/proj
+gem-pw --edit <id> --name "New" --instructions "New prompt..."
+gem-pw --delete <id>
+gem-pw --upload <id> -f file "Summarize this"
+gem-pw --img <id> "A schematic of a double pendulum"
 ```
 
 ## Quick Reference
 
-- One tool: `gem.py` with subcommands `create | review | chat | upload | delete | img`.
-- `review` = multi-round file+ppt review (resumes thread via `--conv`); `chat` = plain
-  text chat (also continuous with `--conv`); both share the same reply-capture + model-picker logic.
-- CDP endpoint default: `http://127.0.0.1:9223` (Hermes server) · alt `9222` (Windows Chrome).
-- `--json` → compact JSON result on STDOUT (`{"ok":true,"f":"/tmp/...","s":1234,"t":12.3,...}`);
-  full Gem reply always saved to file (path in `"f"`); progress logs on STDERR only.
-- Gem chat URL: `https://gemini.google.com/gem/<GEM_ID>` (NOT `/gems/<id>` — that 404s).
-- File attach: click **Upload & tools** → **Upload files**, then `input[type=file]` (hidden,
-  set via `set_input_files`).
-- Image generation: open **Upload & tools** → **Create image**, type prompt, send; the tool
-  waits for the generated image and captures the response. (Account may hit a daily image quota.)
-- Account-safety: `create` aborts if >1 Google account is detected.
-- Output dir defaults to `$HOME/.cache/gem-pw/` (or `--out` to override).
+| Need | Command |
+|------|---------|
+| Chat | `gem-pw <id> "prompt"` |
+| Multi-turn | `gem-pw <id> -c sess.json "prompt"` |
+| Diff-based iteration | `gem-pw --collab <id> -f file "instr" -o r.md` |
+| Apply the diff | `python3 apply_gem_diff.py r.md file [--dry]` |
+| Create / edit / delete | `gem-pw --create/--edit/--delete <id> ...` |
+| Upload / image | `gem-pw --upload/--img <id> ...` |
+| Force own browser (no CDP) | `gem-pw --no-cdp ...` |
+| Headless auto-wrap | (automatic when DISPLAY unset + xvfb-run present) |
 
 ## Output Format
 
-**Success (chat/review/upload/img):**
+Success (chat/collab/upload/img):
 ```json
-{"ok": true, "action": "review", "f": "/tmp/review_r1.md", "s": 1234, "t": 12.3, "gem": "<GEM_ID>", "conv": "/tmp/conv_url.txt"}
+{"ok": true, "f": "/home/USER/.hermes/gem_pw_output/gem-pw-<ts>.md", "s": 123, "t": 12.3}
 ```
-**Create:**
-```json
-{"ok": true, "action": "create-gem", "id": "<GEM_ID>", "name": "Double Pendulum Sim Designer"}
-```
-**Error:**
-```json
-{"ok": false, "err": "NO_SIGNED_IN", "msg": "..."}
-```
+The full Gem reply is saved to `f` (read it with `read_file`). The JSON is
+~100 chars — intentionally token-efficient. Output dir is profile-aware
+(`$HERMES_HOME/gem_pw_output/`, else `~/.hermes/gem_pw_output/`; override with
+`GEM_PW_OUTPUT_DIR` or `-o`).
 
-Error codes: `NO_SIGNED_IN`, `MULTI_ACCOUNT`, `NO_SAVE`, `NO_REDIRECT`, `NO_INPUT`,
-`EMPTY`, `FILE_NOT_FOUND`, `NO_PROMPT`, `NO_CONV`, `MODE_PICKER`, `NAV_FAIL`, `BAD_URL`.
+Error codes: `NO_SIGNED_IN`, `MULTI_ACCOUNT`, `NO_SAVE`, `NO_REDIRECT`,
+`NO_INPUT`, `EMPTY`, `FILE_NOT_FOUND`, `NO_PROMPT`, `NO_CONV`, `MODE_PICKER`,
+`NAV_FAIL`, `BAD_URL`, `LOCKED`, `NO_DISPLAY`.
 
 ## Pitfalls
 
-- **Correct account required.** A non-Gemini-Advanced account silently downgrades Pro to Flash.
-- **One CDP session at a time.** The tool reuses the shared browser context; don't run two
-  `gem.py` calls against the same Gem page concurrently.
-- **Pro + Extended Thinking is slow.** First-turn reviews can take 1-3 min; run in background.
-- **Gemini "Refining / Answer now" interstitial** is treated as still-loading (not a final answer).
-- **Save → redirect is slow** on a fresh Gem (can exceed 40s); the tool falls back to a name
-  lookup to capture `GEM_ID`.
-- **Image gen quota.** Gemini may decline image generation once a daily limit is reached.
-- **Xvfb required in WSL** for the headed Chromium CDP server: `Xvfb :0 -screen 0 1920x1080x24 &`.
+- **Correct account required.** A non-Gemini-Advanced account silently
+  downgrades Pro to Flash.
+- **One browser at a time.** Concurrent gem-pw runs collide on the Chromium
+  profile → second returns `LOCKED`. Run sequentially. The lock self-heals
+  (steals from a dead PID) so a crashed run doesn't wedge future calls.
+- **Pro + Extended Thinking is slow** (1-3 min). Run in the background;
+  foreground caps at ~60s in some hosts.
+- **Headless fails on Gemini** (anti-bot "Just a moment..."). Use **headed**.
+  The xvfb fallback keeps headed mode on a virtual display for cron/remote.
+- **`--collab` prompt MUST force the exact filename + real content** (verified
+  Jul 2026). Left vague, the Gem emits `--- a/file.py` (wrong name → `patch -p0`
+  can't apply) and/or an empty diff. `apply_gem_diff.py` rejects empty /
+  whitespace-only diffs (`EMPTY_DIFF`).
+- **A knowledge/persona Gem** (e.g. a paper-knowledge Gem) follows the diff
+  protocol less tightly and may append an essay after the diff —
+  `apply_gem_diff.py` ignores the trailing prose (extracts only the first diff
+  block). Prefer a dedicated *coding* Gem for cleanest results.
+- **`apply_gem_diff.py` gotchas (verified Jul 2026):** rejects empty /
+  whitespace-only diffs; previously crashed with `SameFileError` when `patch`
+  applied in place with a non-zero exit (now `out` is only `orig` when applied,
+  fallback copies to a distinct `.applied` path). Re-test with a real AND an
+  empty diff after any edit.
 
 ## Verification
 
 ```bash
-# Help
-python3 gem.py --help
-
-# Create a throwaway Gem
-ID=$(python3 gem.py create --name "TestGem" --instructions /tmp/inst.txt --json | python3 -c "import json,sys;print(json.load(sys.stdin)['id'])")
-
-# Chat
-python3 gem.py chat --gem "$ID" --prompt "1+1=?" -o /tmp/c.md
-
-# Delete it
-python3 gem.py delete --gem "$ID"
+gem-pw --help                       # JSON help
+gem-pw <id> "1+1=?" -o /tmp/c.md    # chat; read /tmp/c.md
+# CDP path: log shows "connected via CDP (http://127.0.0.1:9223)"
+# Apply: apply_gem_diff.py reports {"ok": true, "applied": true}
 ```
 
-## Legacy: gem-pw (standalone)
+## Hermes-native integration
 
-`gem-pw` launches its own persistent Chromium per call (profile at
-`~/.gemini-cli/cr-profile/`). It covers the same Gem operations but does not
-reuse a running CDP server. Use it when no CDP endpoint is available. See its
-`--help` for the full flag set.
-
-As of v4.2 (2026-07-15) gem-pw also gained: a multi-account guard before
-create/edit (refuses >1 signed-in account to avoid silent Pro→Flash
-downgrade), a verified model picker that retries until Pro+Extended is
-confirmed (and logs `model not confirmed` if the base model can't engage —
-e.g. when the account's Flash/Pro quota is exhausted and Gemini only offers
-Flash-Lite), and a fix for a `_click_text_button` crash that broke all saves.
+`gem_tool.py` (ships alongside this skill / repo) registers two agent-native
+tools — `gem_collab` and `gem_chat` — backed by gem-pw (browser only, no API
+fallback). Enable the `gem` toolset (auto-enabled when gem-pw is on PATH; or add
+`gem` to `CONFIGURABLE_TOOLSETS` in `hermes_cli/tools_config.py`). See README
+"For Hermes Agents" for the drop-in steps.
 
 ## License
 
