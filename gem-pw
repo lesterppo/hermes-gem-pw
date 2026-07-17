@@ -1299,16 +1299,26 @@ async def cmd_collab(gem_id, file_paths, instruction, out_path=None, timeout=180
         await asyncio.sleep(3)
 
         # Request a surgical diff, NOT the whole file. This is the core
-        # token-saving instruction.
+        # token-saving instruction. The prompt is strict: the Gem must use the
+        # REAL filename (so patch -p0 can apply), must include the actual
+        # changed lines (never an empty diff), and must not wrap the diff in
+        # prose that apply_gem_diff.py would choke on.
+        fname = Path(file_paths[0]).name
         prompt = (
-            "CONTEXT: the attached file is the current version of an artifact I am building with you. "
-            "TASK: " + instruction + " "
-            "Respond with ONLY a minimal change set, in this order:\n"
-            "1) A unified diff in 'diff -u' format (use the original file path as the 'a/' name and the "
-            "same path as the 'b/' name) showing exactly the lines you changed. Preserve surrounding "
-            "context so `patch -p0` can apply it.\n"
-            "2) If you must add entirely new functions/blocks, output them in a fenced ```newcode block.\n"
-            "Do NOT restate the whole file. Do NOT add commentary outside the diff/newcode blocks."
+            "CONTEXT: the attached file '" + fname + "' is the current version of an artifact "
+            "I am building with you.\\n"
+            "TASK: " + instruction + "\\n"
+            "Respond with ONLY a minimal change set. Rules —violating any makes your answer unusable:\\n"
+            "1) Output a unified diff in 'diff -u' format. The header MUST be:\\n"
+            "     --- a/" + fname + "\\n"
+            "     +++ b/" + fname + "\\n"
+            "   (the EXACT filename '" + fname + "', not 'file.py' or a placeholder). Show the real "
+            "lines you changed with 2-3 lines of unchanged context above/below so `patch -p0` applies it.\\n"
+            "2) The diff MUST contain at least one real added or removed line (a '+' or '-' line that is "
+            "not a header). An empty or context-only diff is a FAILURE — include the actual code.\\n"
+            "3) If you must add entirely new functions/blocks, ALSO output them in a fenced ```newcode block.\\n"
+            "4) Do NOT restate the whole file. Do NOT add any commentary, explanation, or markdown outside "
+            "the diff / ```newcode blocks. Your entire answer is the change set."
         )
         if model or thinking:
             # Only forward an explicit override; otherwise the Gem's persisted
