@@ -1420,6 +1420,7 @@ async def main():
                 "edit": "gem-pw --edit <id> [--name <n>] [--instructions <text>] [--knowledge-file <f>] [--knowledge-code <url>] [--knowledge-photo <img>] [--knowledge-folder <dir>] [-m model] [--thinking extended]",
                 "delete": "gem-pw --delete <id>",
                 "upload": "gem-pw --upload <id> -f <file> \"question\"",
+                "collab": "gem-pw --collab <id> -f <current-file> \"instruction\" [-o out.md] [-t sec] [-m model] [--thinking extended]",
                 "image": "gem-pw --img <id> \"description\"",
                 "flags": "[--cdp [url]] use running headed Chromium page server (9223) if alive; [--no-cdp] force own headed browser; [--json-out] compact JSON; [-q] quiet"
             }}))
