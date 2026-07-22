@@ -25,8 +25,14 @@ gem-pw --help                              → Full help (JSON)
 ## Why
 
 `gemini-webapi`'s internal RPC API returns **UNAUTHENTICATED** for Gem
-operations (as of July 2026). `gem-pw` bypasses this by driving the real
-Gemini web UI through a **headless/headed Chromium** browser via Playwright.
+operations (as of July 2026). Additionally, Google's `batchexecute` and
+`StreamGenerate` POST endpoints are **browser-gated** — they silently drop
+connections from ALL non-browser HTTP clients (curl, urllib, curl_cffi, httpx).
+This is universal across WSL2, native Windows, and native Linux.
+
+**Only a real browser** (with its TLS fingerprint, HTTP/2 stack, and header
+ordering) can reach these endpoints. `gem-pw` drives a real Chromium browser
+via Playwright, bypassing both the UNAUTHENTICATED gate and the browser-gating.
 
 A **Gem is a UI construct** — its bundled instruction + knowledge are NOT
 exposed by the raw Gemini API, so the Gemini Interactions API /
