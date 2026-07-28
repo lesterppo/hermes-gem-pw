@@ -1,0 +1,751 @@
+#!/usr/bin/env python3
+"""
+gemini-web — AI-agent-native CLI for ALL Gemini Web functions.
+Drives gemini.google.com via Windows Chrome CDP (Playwright).
+
+Token-efficient: pointer JSON on stdout, full response on disk.
+Zero API keys. Browser auth via persistent Chrome profile.
+
+Functions:
+  chat       Direct chat (Flash/Pro/Lite, extended thinking)
+  multi      Multi-turn conversation with context
+  img        Image generation via Imagen
+  upload     Upload files for analysis
+  research   Deep research mode
+  history    List/read/delete chat history
+  account    Account + model info
+  gems       List/open Gems
+
+Usage:
+  gemini-web chat "prompt" [-m flash|pro|lite] [--thinking extended] [-o out.md]
+  gemini-web multi [-c sess.json] "turn1" "turn2" ...
+  gemini-web img "a cat wearing a hat" [-o cat.png]
+  gemini-web upload -f report.pdf "summarize this"
+  gemini-web research "complex multi-step question"
+  gemini-web history [--list|--read ID|--delete ID]
+  gemini-web account
+  gemini-web gems [--list|--open ID "prompt"]
+
+Output (stdout):
+  {"ok":true,"f":"/path/to/response.md","s":1234,"t":4.5}
+  {"ok":false,"err":"TIMEOUT","msg":"..."}
+"""
+
+import asyncio, argparse, json, os, re, sys, time
+from datetime import datetime, timezone
+from pathlib import Path
+from playwright.async_api import async_playwright, TimeoutError as PwTimeout
+
+# ═══════════════════════════════════════════════════════════════
+# Configuration
+# ═══════════════════════════════════════════════════════════════
+
+_DEFAULT_CDP = "http://127.0.0.1:9224"
+CDP_URL = os.environ.get("GEMINI_CDP", os.environ.get("GEM_PW_CDP", _DEFAULT_CDP))
+OUTPUT_DIR = Path(os.environ.get("GEMINI_OUTPUT", os.path.expanduser("~/.hermes/gem_pw_output")))
+OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+APP_URL = "https://gemini.google.com/app"
+GEM_CREATE_URL = "https://gemini.google.com/gems/create"
+
+# Model mappings (locale-agnostic: zh-TW + English)
+MODEL_MAP = {
+    "flash":      {"label": "Flash",      "menuitem": "Flash",      "alt": "3.6 Flash"},
+    "pro":        {"label": "3.1 Pro",    "menuitem": "3.1 Pro",    "alt": "Pro"},
+    "lite":       {"label": "3.5 Flash-Lite", "menuitem": "3.5 Flash-Lite", "alt": "Flash-Lite"},
+    "flash-lite": {"label": "3.5 Flash-Lite", "menuitem": "3.5 Flash-Lite", "alt": "Flash-Lite"},
+}
+
+THINKING_MAP = {
+    "extended": "延伸思考",
+    "standard": "標準思考",
+}
+
+SELECTORS = {
+    "chat_input": 'div[role="textbox"]',
+    "model_picker": 'button[aria-label*="模式挑選器"], button[aria-label*="mode picker"], button[aria-label*="Open mode picker"]',
+    "menuitem": '[role="menuitem"]',
+    "sidebar_toggle": 'button[aria-label*="主選單"], button[aria-label*="選單"], button[aria-label*="menu"], button[aria-label*="navigation"]',
+    "new_chat": 'button[aria-label*="新對話"], button[aria-label*="new chat"], a[href="/app"]',
+    "plus_menu": 'button[aria-label*="Upload"], button[aria-label*="上載"], button[aria-label*="tools"]',
+    "file_input": 'input[type="file"]',
+    "deep_research": 'button:has-text("Deep research"), button:has-text("深度研究")',
+    "chat_list": 'a[href*="/app/"]',
+    "chat_item": '[class*="conversation"], [class*="chat-item"], [class*="history-item"]',
+    "dismiss_btn": 'button:has-text("我知道了"), button:has-text("Got it"), button:has-text("OK")',
+}
+
+LONG_TIMEOUT = 120  # for deep research
+DEFAULT_TIMEOUT = 60
+FAST_TIMEOUT = 30
+
+# ═══════════════════════════════════════════════════════════════
+# Output helpers (token-efficient)
+# ═══════════════════════════════════════════════════════════════
+
+def _ok(**kw):
+    return json.dumps({"ok": True, **kw})
+
+def _err(code, msg, **kw):
+    return json.dumps({"ok": False, "err": code, "msg": msg, **kw})
+
+def _emit(data):
+    print(data, flush=True)
+
+def _save(text, prefix="gemini-web"):
+    ts = int(time.time())
+    path = OUTPUT_DIR / f"{prefix}-{ts}.md"
+    path.write_text(text, encoding="utf-8")
+    return str(path)
+
+def _log(msg):
+    print(f"[gemini-web] {msg}", file=sys.stderr, flush=True)
+
+# ═══════════════════════════════════════════════════════════════
+# Browser helpers
+# ═══════════════════════════════════════════════════════════════
+
+async def _dismiss_dialogs(page):
+    """Dismiss 'Got it' / '我知道了' dialogs."""
+    for _ in range(3):
+        try:
+            btn = await page.query_selector(SELECTORS["dismiss_btn"])
+            if btn and await btn.is_visible():
+                await btn.click(timeout=3000)
+                await page.wait_for_timeout(800)
+        except Exception:
+            break
+
+async def _ensure_app(page):
+    """Navigate to app if not already there."""
+    if "/app" not in page.url:
+        await page.goto(APP_URL, timeout=15000, wait_until="domcontentloaded")
+        await page.wait_for_timeout(3000)
+        await _dismiss_dialogs(page)
+
+async def _find_input(page):
+    """Find and return the chat input element."""
+    await _ensure_app(page)
+    inp = await page.wait_for_selector(SELECTORS["chat_input"], timeout=10000)
+    return inp
+
+async def _select_model(page, model_str):
+    """Switch model in the Gemini UI."""
+    if not model_str or model_str == "flash":
+        return  # default
+
+    cfg = MODEL_MAP.get(model_str)
+    if not cfg:
+        _log(f"unknown model: {model_str}")
+        return
+
+    try:
+        # Open model picker
+        btn = await page.query_selector(SELECTORS["model_picker"])
+        if not btn:
+            return
+        await btn.click()
+        await page.wait_for_timeout(1200)
+
+        # Find matching menuitem
+        found = False
+        items = await page.query_selector_all(SELECTORS["menuitem"])
+        for item in items:
+            text = (await item.inner_text()).strip()
+            if cfg["menuitem"] in text or cfg["alt"] in text:
+                await item.click()
+                found = True
+                await page.wait_for_timeout(1500)
+                break
+
+        if not found:
+            _log(f"model '{model_str}' not found in picker")
+    except Exception as e:
+        _log(f"model select failed: {e}")
+
+async def _select_thinking(page, thinking):
+    """Toggle extended thinking (separate menu open)."""
+    if not thinking or thinking == "standard":
+        return
+
+    try:
+        # Open model picker again (menu closes after each selection)
+        btn = await page.query_selector(SELECTORS["model_picker"])
+        if not btn:
+            return
+        await btn.click()
+        await page.wait_for_timeout(1200)
+
+        # Find thinking menuitem
+        items = await page.query_selector_all(SELECTORS["menuitem"])
+        for item in items:
+            text = (await item.inner_text()).strip()
+            if "延伸思考" in text or "Extended thinking" in text or "extended" in text.lower():
+                await item.click()
+                await page.wait_for_timeout(1500)
+                break
+    except Exception as e:
+        _log(f"thinking select failed: {e}")
+
+async def _click_plus_menu(page):
+    """Open the '+' / upload menu."""
+    try:
+        # The plus/tools button near the chat input
+        btns = await page.query_selector_all('button')
+        for btn in btns:
+            try:
+                aria = await btn.get_attribute("aria-label") or ""
+                if "upload" in aria.lower() or "上載" in aria or "tools" in aria.lower():
+                    await btn.click()
+                    await page.wait_for_timeout(1000)
+                    return True
+            except:
+                pass
+        # Fallback: look for the paperclip/plus icon
+        plus = await page.query_selector('button mat-icon, button [class*="upload"], button [class*="plus"]')
+        if plus:
+            await plus.click()
+            await page.wait_for_timeout(1000)
+            return True
+    except:
+        pass
+    return False
+
+async def _extract_response(page, prompt, wait_s=6):
+    """Wait for and extract Gemini's response from page body."""
+    await page.wait_for_timeout(int(wait_s * 1000))
+    body = await page.evaluate("document.body.innerText")
+
+    # Find the LAST occurrence of the prompt (for multi-turn)
+    search = prompt[:30]
+    # Find all occurrences, take last
+    positions = [m.start() for m in re.finditer(re.escape(search[:15]), body)]
+    idx = positions[-1] if positions else -1
+
+    if idx >= 0:
+        after = body[idx:]
+
+        # Find the LAST "Gemini 說了" / "Gemini said" after the prompt
+        said_match = None
+        for m in re.finditer(r'(Gemini (?:說了|said)|模型 (?:說了|said))', after):
+            said_match = m
+
+        if said_match:
+            # Take everything after "說了" marker
+            response_start = said_match.end()
+            response_text = after[response_start:]
+
+            # Strip leading whitespace/newlines
+            response_text = response_text.strip()
+
+            # Cut at model footer markers
+            for cutoff in ['\n\n\n\nFlash', '\n\n\n\nPro', '\n\n\n\nLite',
+                          '\n\nFlash\n', '\n\nPro\n', '\n\nLite\n',
+                          '\nGemini 是 AI', '\nGemini may display',
+                          '\n你說了\n', '\nYou said\n',
+                          '\n適用《Google', '\nGemini 是',
+                          '\nGemini 可能會']:
+                cut_idx = response_text.find(cutoff)
+                if cut_idx > 0:
+                    response_text = response_text[:cut_idx]
+
+            return response_text.strip()
+
+    return body[:500]
+
+async def _send_and_wait(page, prompt, wait_s=8):
+    """Type prompt, press Enter, wait for response."""
+    inp = await _find_input(page)
+    await inp.click()
+    await page.keyboard.press("Control+a")
+    await page.keyboard.type(prompt)
+    await page.keyboard.press("Enter")
+
+    t0 = time.time()
+    text = await _extract_response(page, prompt, wait_s)
+    elapsed = time.time() - t0
+    return text, elapsed
+
+# ═══════════════════════════════════════════════════════════════
+# Command implementations
+# ═══════════════════════════════════════════════════════════════
+
+async def cmd_chat(args):
+    """Direct chat (single turn)."""
+    async with async_playwright() as pw:
+        browser = await pw.chromium.connect_over_cdp(args.cdp or CDP_URL)
+        page = await browser.new_page()
+
+        await _select_model(page, args.model)
+        await _select_thinking(page, args.thinking)
+
+        prompt = " ".join(args.prompt) if isinstance(args.prompt, list) else args.prompt
+        if args.brief:
+            prompt = "Be concise. " + prompt
+
+        text, elapsed = await _send_and_wait(page, prompt, args.wait)
+
+        if not text:
+            _emit(_err("EMPTY", "No response extracted"))
+        elif args.json_out or args.output:
+            path = args.output or _save(text)
+            _emit(_ok(f=path, s=len(text), t=round(elapsed, 1), model=args.model))
+        else:
+            print(text)
+
+        await browser.close()
+
+
+async def cmd_multi(args):
+    """Multi-turn conversation."""
+    prompts = args.prompts
+
+    async with async_playwright() as pw:
+        browser = await pw.chromium.connect_over_cdp(args.cdp or CDP_URL)
+        page = await browser.new_page()
+
+        await _select_model(page, args.model)
+        await _select_thinking(page, args.thinking)
+
+        # Resume session if provided
+        if args.conversation and Path(args.conversation).exists():
+            conv_url = Path(args.conversation).read_text().strip()
+            if "/app/" in conv_url:
+                await page.goto(conv_url, timeout=15000)
+                await page.wait_for_timeout(3000)
+
+        results = []
+        for i, prompt in enumerate(prompts):
+            if args.brief and i == 0:
+                prompt = "Be concise. " + prompt
+
+            _log(f"Turn {i+1}/{len(prompts)}")
+            text, elapsed = await _send_and_wait(page, prompt, args.wait)
+            results.append({"turn": i+1, "prompt": prompt, "response": text, "time": elapsed})
+
+            # Save conversation URL for resumption
+            if args.conversation and "/app/" in page.url:
+                Path(args.conversation).write_text(page.url)
+
+        # Output
+        all_text = "\n\n---\n\n".join(
+            f"## Turn {r['turn']} ({r['time']:.1f}s)\n\n**Q:** {r['prompt']}\n\n**A:** {r['response']}"
+            for r in results
+        )
+
+        if args.json_out or args.output:
+            path = args.output or _save(all_text, "gemini-multi")
+            _emit(_ok(f=path, s=len(all_text), turns=len(results)))
+        else:
+            print(all_text)
+
+        await browser.close()
+
+
+async def cmd_img(args):
+    """Image generation via Imagen — uses Upload & tools → Create image drawer."""
+    prompt = " ".join(args.prompt) if isinstance(args.prompt, list) else args.prompt
+
+    async with async_playwright() as pw:
+        browser = await pw.chromium.connect_over_cdp(args.cdp or CDP_URL)
+        page = await browser.new_page()
+        await page.goto(f"{APP_URL}", wait_until="domcontentloaded", timeout=30000)
+        await page.wait_for_timeout(4000)
+
+        # Image gen works with Flash model
+        await _select_model(page, "flash")
+        await _dismiss_dialogs(page)
+
+        # Click "Upload & tools" button to open the drawer
+        tools = await page.query_selector('button[aria-label="Upload & tools"]')
+        if not tools:
+            tools = await page.query_selector('[aria-label*="Upload"][aria-label*="tool"]')
+        if tools:
+            await tools.click()
+            await page.wait_for_timeout(2000)
+
+        # Click "Create image" in the toolbox drawer
+        clicked = await page.evaluate("""() => {
+            const items = document.querySelectorAll('toolbox-drawer-item');
+            for (const item of items) {
+                if ((item.innerText||'').trim().startsWith('Create image')) {
+                    item.click(); return 'ok';
+                }
+            }
+            return 'not-found';
+        }""")
+        if clicked != 'ok':
+            _log("Create image not found in drawer, falling back to text prompt")
+        await page.wait_for_timeout(3000)
+
+        _log(f"Generating image: {prompt}")
+        text, elapsed = await _send_and_wait(page, prompt, max(args.wait, 60))
+
+        # Wait for image rendering (Imagen can take extra time)
+        images = []
+        for _ in range(15):
+            await page.wait_for_timeout(3000)
+            images = await page.evaluate("""() => {
+                const imgs = document.querySelectorAll('img[src*="googleapis"], img[src*="generated"], .response-content img');
+                return Array.from(imgs).map(i => ({src: i.src, alt: i.alt || ''}));
+            }""")
+            if images:
+                break
+
+        if args.json_out or args.output:
+            result = json.dumps({"response": text[:500] if text else "", "images": images, "time": elapsed})
+            path = args.output or _save(result, "gemini-img")
+            _emit(_ok(f=path, s=len(text or ""), img=len(images), t=round(elapsed, 1)))
+        else:
+            print(text or "[no text response]")
+            for img in images:
+                print(f"IMAGE: {img['src']}")
+
+        await browser.close()
+
+
+async def cmd_upload(args):
+    """Upload file(s) and optionally ask a question."""
+    if not args.file:
+        _emit(_err("NO_FILE", "Use -f/--file to specify file(s) to upload"))
+        return
+
+    question = " ".join(args.prompt) if args.prompt else "Summarize this."
+
+    async with async_playwright() as pw:
+        browser = await pw.chromium.connect_over_cdp(args.cdp or CDP_URL)
+        page = await browser.new_page()
+        await page.goto(APP_URL, timeout=15000, wait_until="domcontentloaded")
+        await page.wait_for_timeout(3000)
+        await _dismiss_dialogs(page)
+
+        # Upload flow:
+        # 1. Click "上傳與工具" button  
+        # 2. Dismiss any dialog that appears
+        # 3. Click upload button via force click
+        # 4. File input appears — set files
+        uploaded = False
+        try:
+            # Step 1: Open upload menu
+            menu_btn = await page.query_selector('button[aria-label="上傳與工具"]')
+            _log(f"Menu btn: {'found' if menu_btn else 'MISSING'}")
+            if menu_btn:
+                await menu_btn.click()
+                await page.wait_for_timeout(1200)
+                await _dismiss_dialogs(page)
+
+                # Step 2: Find and click upload button (force click to bypass disabled)
+                upload_btn = await page.query_selector('button[aria-label*="上傳檔案"]')
+                _log(f"Upload btn: {'found' if upload_btn else 'MISSING'}")
+                if upload_btn:
+                    # Force click — bypasses disabled state
+                    await upload_btn.dispatch_event("click")
+                    await page.wait_for_timeout(2000)
+                else:
+                    # Try clicking the menuitem role
+                    upload_opt = await page.query_selector('[role="menuitem"]:has-text("上傳檔案")')
+                    if upload_opt:
+                        await upload_opt.dispatch_event("click")
+                        await page.wait_for_timeout(2000)
+
+            # Step 3: File input
+            file_input = await page.query_selector('input[type="file"]')
+            _log(f"File input: {'found' if file_input else 'MISSING'}")
+            if file_input:
+                await file_input.set_input_files(args.file)
+                uploaded = True
+                _log(f"Uploaded {len(args.file)} file(s)")
+                await page.wait_for_timeout(2000)
+        except Exception as e:
+            _log(f"Upload error: {e}")
+
+        # Send question
+        text, elapsed = await _send_and_wait(page, question, args.wait)
+
+        if args.json_out or args.output:
+            path = args.output or _save(text or "", "gemini-upload")
+            _emit(_ok(f=path, s=len(text or ""), uploaded=uploaded, t=round(elapsed, 1)))
+        else:
+            print(text or "[no response]")
+
+        await browser.close()
+
+
+async def cmd_research(args):
+    """Deep research mode."""
+    prompt = " ".join(args.prompt) if isinstance(args.prompt, list) else args.prompt
+
+    async with async_playwright() as pw:
+        browser = await pw.chromium.connect_over_cdp(args.cdp or CDP_URL)
+        page = await browser.new_page()
+        await _select_model(page, args.model or "pro")
+        await _select_thinking(page, "extended")
+
+        # Try clicking deep research button
+        try:
+            dr_btn = await page.query_selector(SELECTORS["deep_research"])
+            if dr_btn:
+                await dr_btn.click()
+                await page.wait_for_timeout(1000)
+                _log("Deep research mode activated")
+        except:
+            pass
+
+        _log(f"Deep research: {prompt[:80]}...")
+        text, elapsed = await _send_and_wait(page, prompt, max(args.wait, 30))
+
+        if args.json_out or args.output:
+            path = args.output or _save(text or "", "gemini-research")
+            _emit(_ok(f=path, s=len(text or ""), t=round(elapsed, 1)))
+        else:
+            print(text or "[no response]")
+
+        await browser.close()
+
+
+async def cmd_history(args):
+    """Chat history management."""
+    async with async_playwright() as pw:
+        browser = await pw.chromium.connect_over_cdp(args.cdp or CDP_URL)
+        page = await browser.new_page()
+        await page.goto(APP_URL, timeout=15000)
+        await page.wait_for_timeout(3000)
+
+        if args.read_chat or args.delete_chat:
+            cid = args.read_chat or args.delete_chat
+            # Navigate to specific chat
+            await page.goto(f"https://gemini.google.com/app/{cid}", timeout=15000)
+            await page.wait_for_timeout(3000)
+
+            if args.read_chat:
+                body = await page.evaluate("document.body.innerText")
+                _emit(_ok(chat_id=cid, content=body[:5000]))
+            elif args.delete_chat:
+                # Find and click delete button
+                try:
+                    menu = await page.query_selector('button[aria-label*="更多"], button[aria-label*="more"]')
+                    if menu:
+                        await menu.click()
+                        await page.wait_for_timeout(500)
+                        delete_btn = await page.query_selector('[role="menuitem"]:has-text("Delete"), [role="menuitem"]:has-text("刪除")')
+                        if delete_btn:
+                            await delete_btn.click()
+                            _emit(_ok(action="deleted", chat_id=cid))
+                        else:
+                            _emit(_err("NO_DELETE", "Delete button not found"))
+                    else:
+                        _emit(_err("NO_MENU", "Menu button not found"))
+                except Exception as e:
+                    _emit(_err("DELETE_FAILED", str(e)))
+        else:
+            # List chats
+            chats = await page.evaluate("""() => {
+                const result = [];
+                document.querySelectorAll('a[href*="/app/"]').forEach(a => {
+                    const href = a.getAttribute('href');
+                    const m = href.match(/\\/app\\/([a-f0-9]+)/);
+                    if (m) {
+                        result.push({id: m[1], title: (a.innerText || '').substring(0, 100)});
+                    }
+                });
+                return result;
+            }""")
+
+            _emit(_ok(chats=chats, count=len(chats)))
+
+        await browser.close()
+
+
+async def cmd_account(args):
+    """Account information."""
+    async with async_playwright() as pw:
+        browser = await pw.chromium.connect_over_cdp(args.cdp or CDP_URL)
+        page = await browser.new_page()
+        await page.goto(APP_URL, timeout=15000)
+        await page.wait_for_timeout(3000)
+
+        # Extract account info from page
+        info = await page.evaluate("""() => {
+            const body = document.body.innerText;
+            // Find model info
+            const models = [];
+            const pickerBtn = document.querySelector('button[aria-label*="mode picker"], button[aria-label*="模式挑選器"]');
+            const currentModel = pickerBtn ? pickerBtn.getAttribute('aria-label') || pickerBtn.innerText : 'unknown';
+
+            // Check for account email
+            const emailMatch = body.match(/[\\w.+-]+@gmail\\.com/);
+            const email = emailMatch ? emailMatch[0] : null;
+
+            return {
+                current_model: currentModel.substring(0, 100),
+                signed_in: !!email,
+                email: email,
+                has_chat_input: !!document.querySelector('div[role="textbox"]'),
+            };
+        }""")
+
+        _emit(_ok(**info))
+        await browser.close()
+
+
+async def cmd_gems(args):
+    """Gem management (basic)."""
+    async with async_playwright() as pw:
+        browser = await pw.chromium.connect_over_cdp(args.cdp or CDP_URL)
+        page = await browser.new_page()
+
+        if args.open_gem:
+            gem_id = args.open_gem
+            prompt = " ".join(args.prompt) if args.prompt else "Hello"
+
+            await page.goto(f"https://gemini.google.com/gem/{gem_id}", timeout=15000)
+            await page.wait_for_timeout(3000)
+            await _dismiss_dialogs(page)
+
+            text, elapsed = await _send_and_wait(page, prompt, args.wait)
+
+            if args.json_out or args.output:
+                path = args.output or _save(text or "", "gemini-gem")
+                _emit(_ok(f=path, s=len(text or ""), gem=gem_id, t=round(elapsed, 1)))
+            else:
+                print(text or "[no response]")
+        else:
+            # List Gems
+            await page.goto(APP_URL, timeout=15000)
+            await page.wait_for_timeout(3000)
+
+            # Open sidebar to find Gems
+            try:
+                sidebar = await page.query_selector(SELECTORS["sidebar_toggle"])
+                if sidebar:
+                    await sidebar.click()
+                    await page.wait_for_timeout(1000)
+            except:
+                pass
+
+            gems = await page.evaluate("""() => {
+                const result = [];
+                document.querySelectorAll('a[href*="/gem/"]').forEach(a => {
+                    const href = a.getAttribute('href');
+                    const m = href.match(/\\/gem\\/([a-f0-9]+)/);
+                    if (m) {
+                        result.push({id: m[1], name: (a.innerText || a.getAttribute('aria-label') || '').substring(0, 60)});
+                    }
+                });
+                return result;
+            }""")
+
+            _emit(_ok(gems=gems, count=len(gems)))
+
+        await browser.close()
+
+
+# ═══════════════════════════════════════════════════════════════
+# CLI
+# ═══════════════════════════════════════════════════════════════
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="gemini-web — AI-agent-native CLI for ALL Gemini Web functions")
+    sub = parser.add_subparsers(dest="command")
+
+    # ── chat ──
+    p = sub.add_parser("chat", help="Direct chat (single turn)")
+    p.add_argument("prompt", nargs="+", help="Prompt text")
+    p.add_argument("-m", "--model", choices=["flash", "pro", "lite", "flash-lite"],
+                   default="flash", help="Model (default: flash)")
+    p.add_argument("--thinking", choices=["standard", "extended"], help="Thinking tier")
+    p.add_argument("-o", "--output", help="Output file path")
+    p.add_argument("--json-out", action="store_true", help="JSON output")
+    p.add_argument("--brief", action="store_true", help="Prepend 'Be concise.'")
+    p.add_argument("-w", "--wait", type=int, default=10, help="Max wait seconds")
+    p.add_argument("--cdp", help="CDP URL override")
+
+    # ── multi ──
+    p = sub.add_parser("multi", help="Multi-turn conversation")
+    p.add_argument("prompts", nargs="+", help="Prompts (one per turn)")
+    p.add_argument("-m", "--model", choices=["flash", "pro", "lite", "flash-lite"], default="flash")
+    p.add_argument("--thinking", choices=["standard", "extended"])
+    p.add_argument("-c", "--conversation", help="Conversation state file (for resume)")
+    p.add_argument("-o", "--output")
+    p.add_argument("--json-out", action="store_true")
+    p.add_argument("--brief", action="store_true")
+    p.add_argument("-w", "--wait", type=int, default=10)
+    p.add_argument("--cdp")
+
+    # ── img ──
+    p = sub.add_parser("img", help="Image generation")
+    p.add_argument("prompt", nargs="+", help="Image description")
+    p.add_argument("-o", "--output")
+    p.add_argument("--json-out", action="store_true")
+    p.add_argument("-w", "--wait", type=int, default=20)
+    p.add_argument("--cdp")
+
+    # ── upload ──
+    p = sub.add_parser("upload", help="Upload files and chat")
+    p.add_argument("prompt", nargs="*", help="Question about the files")
+    p.add_argument("-f", "--file", action="append", required=True, help="File(s) to upload")
+    p.add_argument("-m", "--model", choices=["flash", "pro", "lite", "flash-lite"], default="flash")
+    p.add_argument("-o", "--output")
+    p.add_argument("--json-out", action="store_true")
+    p.add_argument("-w", "--wait", type=int, default=15)
+    p.add_argument("--cdp")
+
+    # ── research ──
+    p = sub.add_parser("research", help="Deep research")
+    p.add_argument("prompt", nargs="+", help="Research question")
+    p.add_argument("-m", "--model", choices=["flash", "pro", "lite", "flash-lite"], default="pro")
+    p.add_argument("-o", "--output")
+    p.add_argument("--json-out", action="store_true")
+    p.add_argument("-w", "--wait", type=int, default=60)
+    p.add_argument("--cdp")
+
+    # ── history ──
+    p = sub.add_parser("history", help="Chat history")
+    p.add_argument("--list", action="store_true", default=True, help="List chats (default)")
+    p.add_argument("--read-chat", metavar="ID", help="Read specific chat")
+    p.add_argument("--delete-chat", metavar="ID", help="Delete specific chat")
+    p.add_argument("--cdp")
+
+    # ── account ──
+    p = sub.add_parser("account", help="Account info")
+    p.add_argument("--cdp")
+
+    # ── gems ──
+    p = sub.add_parser("gems", help="List/open Gems")
+    p.add_argument("--list", action="store_true", default=True, help="List Gems (default)")
+    p.add_argument("--open-gem", metavar="ID", dest="open_gem", help="Open and chat with a Gem")
+    p.add_argument("prompt", nargs="*", help="Prompt for Gem chat")
+    p.add_argument("-o", "--output")
+    p.add_argument("--json-out", action="store_true")
+    p.add_argument("-w", "--wait", type=int, default=15)
+    p.add_argument("--cdp")
+
+    args = parser.parse_args()
+
+    if not args.command:
+        parser.print_help()
+        return
+
+    try:
+        if args.command == "chat":
+            asyncio.run(cmd_chat(args))
+        elif args.command == "multi":
+            asyncio.run(cmd_multi(args))
+        elif args.command == "img":
+            asyncio.run(cmd_img(args))
+        elif args.command == "upload":
+            asyncio.run(cmd_upload(args))
+        elif args.command == "research":
+            asyncio.run(cmd_research(args))
+        elif args.command == "history":
+            asyncio.run(cmd_history(args))
+        elif args.command == "account":
+            asyncio.run(cmd_account(args))
+        elif args.command == "gems":
+            asyncio.run(cmd_gems(args))
+    except Exception as e:
+        _emit(_err("FATAL", str(e)))
+
+
+if __name__ == "__main__":
+    main()
