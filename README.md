@@ -144,6 +144,13 @@ disk at `~/.hermes/gem_pw_output/` (or `$HERMES_HOME/gem_pw_output/`).
 {"ok": true, "f": "/home/USER/.hermes/gem_pw_output/gem-pw-1783463794.md", "s": 16, "t": 11.7}
 ```
 
+## Related Projects
+
+- **[hermes-gem-cli](https://github.com/lesterppo/hermes-gem-cli)** — WebAPI-based
+  Gemini Gem CLI. 3-10x faster on native Linux (~4s vs ~15-40s). Uses browser
+  cookies (no API key). Best for direct chat, cron/headless use, and quick Gem
+  ops. Does NOT support knowledge upload at Gem creation — for that, use gem-pw.
+
 ## For Hermes Agents
 
 This tool is built for AI-agent consumption. See [AGENTS.md](AGENTS.md) for the
