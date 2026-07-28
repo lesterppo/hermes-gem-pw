@@ -170,21 +170,22 @@ full agent integration guide.
 - aiohttp
 - An X display (or `xvfb-run` for headless)
 
-## Comparison: gem-pw vs Gemini API vs gemini-webapi
+## Comparison: gem-pw vs gem-cli vs Gemini API
 
-| Feature | gem-pw (this repo) | Gemini API Key | gemini-webapi |
+| Feature | gem-pw (CDP) | gem-cli (WebAPI) | Gemini API Key |
 |---------|:---:|:---:|:---:|
-| Gem chat (target specific Gem) | ✅ | ❌ (UI construct) | ⚠️ account-gated |
-| Gem CRUD (create/edit/delete) | ✅ | ❌ | ⚠️ account-gated |
+| Gem chat (target specific Gem) | ✅ | ✅ | ❌ (UI construct) |
+| Gem CRUD (create/edit/delete) | ✅ | ✅ | ❌ |
 | Direct chat (no Gem) | ✅ | ✅ | ✅ |
-| Image generation (Imagen) | ✅ | ✅ | ❌ |
-| Deep research | ✅ | ❌ | ❌ |
-| File upload into Gem | ✅ | ❌ | ⚠️ |
+| Image generation (Imagen) | ✅ | ✅ | ✅ |
+| Deep research | ✅ | ✅ | ❌ |
+| File upload into Gem | ✅ | ✅ | ❌ |
 | Multi-turn conversation | ✅ | ✅ | ✅ |
-| No API key required | ✅ | ❌ | ❌ |
-| Knowledge upload at Gem creation | ✅ | ❌ | ❌ |
+| No API key required | ✅ | ✅ | ❌ |
+| Knowledge at Gem creation | ✅ | ❌ | ❌ |
+| Chat speed | ~15-40s | **~4s** | ~2-5s |
+| Works on WSL2 | ✅ | ❌ (hangs) | ✅ |
 | Works on native Linux | ✅ | ✅ | ✅ |
-| Works on WSL2 | ✅ | ✅ | ❌ (hangs) |
 
 ## Repository
 
