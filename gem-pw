@@ -29,7 +29,7 @@ Commands:
   gem-pw --delete <id>                  Delete Gem
   gem-pw --upload <id> -f <file> "Q"   Upload file + ask
   gem-pw --collab <id> -f <file> "Instr"  Upload artifact + request surgical diff only (token-efficient)
-  gem-pw --img <id> "description"       Generate image + download
+  gem-pw --img <id> "description"       Generate image (Gem context; omit <id> for main app)
   gem-pw --help                         This help
 """
 
@@ -257,8 +257,8 @@ async def _pick(page, matchers):
                 el = await page.query_selector(m)
             if el:
                 return el
-        except Exception:
-            pass
+        except Exception as e:
+            _log(f"_pick failed for {str(m)[:60]}: {e}")
     return None
 
 async def _pick_text_button(page, labels):
@@ -662,8 +662,8 @@ async def _select_model(page, model, thinking):
         return True
 
     model_map = {
-        "flash-lite": ["3.1 Flash-Lite", "Flash-Lite"],
-        "flash": ["3.5 Flash", "Flash"],
+        "flash-lite": ["3.5 Flash-Lite", "Flash-Lite"],
+        "flash": ["3.6 Flash", "Flash"],
         "pro": ["3.1 Pro", "Pro"],
         "pro-latest": ["3.1 Pro", "Pro"],
     }
@@ -812,7 +812,7 @@ async def cmd_create(name, instructions, knowledge_files=None, knowledge_code=No
             ])
             if model_btn:
                 await model_btn.click(); await asyncio.sleep(3)
-                model_map = {"flash-lite": "3.1 Flash-Lite", "flash": "3.5 Flash", "pro": "3.1 Pro", "pro-latest": "3.1 Pro"}
+                model_map = {"flash-lite": "3.5 Flash-Lite", "flash": "3.6 Flash", "pro": "3.1 Pro", "pro-latest": "3.1 Pro"}
                 target = model_map.get(model.lower(), model)
                 await page.evaluate("(t) => { document.querySelectorAll('[role=menuitem]').forEach(i => { if ((i.innerText||'').includes(t)) i.click(); }); }", target)
                 await asyncio.sleep(2)
@@ -1025,7 +1025,7 @@ async def cmd_edit(gem_id, name=None, instructions=None, knowledge_files=None,
             ])
             if model_btn:
                 await model_btn.click(); await asyncio.sleep(3)
-                model_map = {"flash-lite": "3.1 Flash-Lite", "flash": "3.5 Flash", "pro": "3.1 Pro", "pro-latest": "3.1 Pro"}
+                model_map = {"flash-lite": "3.5 Flash-Lite", "flash": "3.6 Flash", "pro": "3.1 Pro", "pro-latest": "3.1 Pro"}
                 target = model_map.get(model.lower(), model)
                 await page.evaluate("(t) => { document.querySelectorAll('[role=menuitem]').forEach(i => { if ((i.innerText||'').includes(t)) i.click(); }); }", target)
                 await asyncio.sleep(2)
@@ -1141,39 +1141,38 @@ async def cmd_delete(gem_id, cdp=None):
     pw, ctx, page = await _launch(cdp=cdp)
     try:
         _log(f"delete: {gem_id}")
-        await page.goto(f"https://gemini.google.com/gem/{gem_id}", wait_until="domcontentloaded", timeout=30000)
+
+        # Navigate to Gems list page
+        await page.goto("https://gemini.google.com/gems/view",
+                        wait_until="domcontentloaded", timeout=30000)
         await asyncio.sleep(5)
 
+        # Find Gem card by href (contains gem_id), then click its "More options" button
         clicked = await page.evaluate("""(gid) => {
-            const btns = document.querySelectorAll('button, [role="button"]');
-            for (const b of btns) {
-                const ar = (b.getAttribute('aria-label')||'').toLowerCase();
-                const tx = (b.innerText||'').toLowerCase();
-                if (((ar.includes('gem') || ar.includes('選項') || ar.includes('options') || ar.includes('more')) &&
-                     (ar.includes('gem') || ar.includes('其他') || ar.includes('other'))) &&
-                    b.offsetParent) {
-                    b.click();
-                    return 'clicked:' + ar.slice(0,40);
+            const links = document.querySelectorAll('a[href*="' + gid + '"]');
+            for (const a of links) {
+                const parent = a.closest('li, div, section') || a.parentElement;
+                const btn = parent ? parent.querySelector('button[aria-label*="More options"]') : null;
+                if (btn) {
+                    btn.click();
+                    const label = btn.getAttribute('aria-label') || '';
+                    return 'clicked:' + label.slice(0, 60);
                 }
             }
             return 'not-found';
         }""", gem_id)
         _log(f"menu: {clicked}")
+        if clicked == 'not-found':
+            return _ok(action="delete-gem", id=gem_id,
+                       msg="Gem not found in list (may already be deleted)")
         await asyncio.sleep(2)
 
         deleted = await page.evaluate("""() => {
-            const all = document.querySelectorAll('*');
-            for (const el of all) {
-                const tx = (el.innerText||'').trim();
-                if ((tx === '刪除' || tx === '刪除 Gem' || tx === 'Delete' || tx === 'Delete gem') &&
-                    el.offsetParent && tx.length < 20) {
-                    el.click();
-                    return 'clicked:' + tx;
-                }
-            }
             const items = document.querySelectorAll('[role="menuitem"]');
             for (const item of items) {
-                if ((item.innerText||'').trim() === '刪除' || (item.innerText||'').trim() === 'Delete') { item.click(); return 'clicked:menuitem'; }
+                if ((item.innerText||'').trim() === 'Delete') {
+                    item.click(); return 'clicked:menuitem';
+                }
             }
             return 'not-found';
         }""")
@@ -1181,10 +1180,9 @@ async def cmd_delete(gem_id, cdp=None):
         await asyncio.sleep(2)
 
         confirmed = await page.evaluate("""() => {
-            const btns = document.querySelectorAll('button');
-            for (const b of btns) {
+            for (const b of document.querySelectorAll('button')) {
                 const tx = (b.innerText||'').trim();
-                if ((tx === '刪除' || tx === 'Delete') && b.offsetParent) {
+                if (tx === 'Delete' && b.offsetParent) {
                     b.click(); return 'confirmed:' + tx;
                 }
             }
@@ -1361,29 +1359,40 @@ async def cmd_collab(gem_id, file_paths, instruction, out_path=None, timeout=180
 
 
 async def cmd_image(gem_id, description, cdp=None):
+    """Generate an image. If gem_id is None/empty, uses main app (no Gem context)."""
     pw, ctx, page = await _launch(cdp=cdp)
     try:
-        _log(f"image: {gem_id}")
-        await page.goto(f"https://gemini.google.com/gem/{gem_id}", wait_until="domcontentloaded", timeout=30000)
+        url = f"https://gemini.google.com/gem/{gem_id}" if gem_id else "https://gemini.google.com/app"
+        _log(f"image: {gem_id or '(main app)'}")
+        await page.goto(url, wait_until="domcontentloaded", timeout=30000)
         await asyncio.sleep(5)
 
+        # Click "Upload & tools" to open the drawer, then click "Create image"
         tools = await _pick(page, [
             '[aria-label="上載同工具"]',
+            'button[aria-label="Upload & tools"]',
             '[aria-label*="Upload" i][aria-label*="tools" i]',
             '[aria-label*="Upload & tools" i]',
         ])
-        if tools: await tools.click(); await asyncio.sleep(2)
+        if tools: await tools.click(); await asyncio.sleep(3)
 
-        clicked = await page.evaluate("""() => {
-            const items = document.querySelectorAll('toolbox-drawer-item');
-            for (const item of items) {
-                if (((item.innerText||'').trim().startsWith('製作圖像')) || ((item.innerText||'').trim().startsWith('Create image'))) {
-                    item.click(); return 'ok';
-                }
-            }
-            return 'not-found';
-        }""")
-        _log(f"img btn: {clicked}")
+        # Retry finding "Create image" drawer item (drawer may take time to render)
+        clicked = "not-found"
+        for _ in range(5):
+            items = await page.query_selector_all('toolbox-drawer-item')
+            for item in items:
+                try:
+                    tx = (await item.inner_text()).strip()
+                except Exception:
+                    continue
+                if tx.startswith('製作圖像') or tx.startswith('Create image'):
+                    await item.click()
+                    clicked = 'ok'
+                    break
+            if clicked == 'ok':
+                break
+            await asyncio.sleep(1)
+        _log(f"img btn: {clicked} ({len(items)} drawer items)")
         await asyncio.sleep(3)
 
         if clicked == 'ok':
@@ -1453,7 +1462,7 @@ async def main():
                 "delete": "gem-pw --delete <id>",
                 "upload": "gem-pw --upload <id> -f <file> \"question\"",
                 "collab": "gem-pw --collab <id> -f <current-file> \"instruction\" [-o out.md] [-t sec] [-m model] [--thinking extended]",
-                "image": "gem-pw --img <id> \"description\"",
+                "image": "gem-pw --img [<id>] \"description\"",
                 "flags": "[--cdp [url]] use running headed Chromium page server (9223) if alive; [--no-cdp] force own headed browser; [--json-out] compact JSON; [-q] quiet"
             }}))
         sys.exit(0)
@@ -1477,6 +1486,9 @@ async def main():
             forced_cdp = True
             if i + 1 < len(args) and not args[i+1].startswith("-"):
                 CDP_URL = args[i+1]
+                del args[i:i+2]  # consume --cdp + URL
+            else:
+                del args[i]      # consume --cdp only
             break
     cdp_mode = forced_cdp if forced_cdp is not None else (CDP_URL if CDP_URL else None)
 
@@ -1544,8 +1556,30 @@ async def main():
         if not fps or not p: _emit(_err("USAGE", "--upload <id> -f <file1> [-f <file2> ...] <question>")); sys.exit(1)
         _emit(await _retry_once(lambda: cmd_upload(gid, fps, p, out_path=out, cdp=cdp_mode)))
     elif args[0] == "--img":
-        if len(args) < 3: _emit(_err("USAGE", "--img <gem-id> <description>")); sys.exit(1)
-        _emit(await cmd_image(args[1], args[2], cdp=cdp_mode))
+        # gem-pw --img [<gem-id>] <description> [-o out.md] [-t sec] [-m model] [--thinking extended]
+        gid = None; desc_parts = []; i = 1
+        while i < len(args):
+            if args[i] == "-o" and i+1 < len(args): i += 2
+            elif args[i] == "-t" and i+1 < len(args): i += 2
+            elif args[i] == "-m" and i+1 < len(args): i += 2
+            elif args[i] == "--thinking" and i+1 < len(args): i += 2
+            elif args[i] in ("-q", "--quiet", "--json-out", "--brief"): i += 1
+            elif args[i].startswith("-"): i += 1
+            elif not gid:
+                # First positional: could be gem_id or description start
+                # If next arg is also positional (not a flag), this is gem_id
+                next_is_flag = (i+1 >= len(args) or args[i+1].startswith("-"))
+                if next_is_flag:
+                    desc_parts.append(args[i])  # only one positional → description
+                else:
+                    gid = args[i]  # two positionals → first is gem_id
+                i += 1
+            else:
+                desc_parts.append(args[i]); i += 1
+        desc = " ".join(desc_parts)
+        if not desc:
+            _emit(_err("USAGE", "--img [<gem-id>] <description>")); sys.exit(1)
+        _emit(await cmd_image(gid, desc, cdp=cdp_mode))
     elif args[0] == "--collab":
         # gem-pw --collab <id> -f <current-file> "instruction" [-o out.md] [-t sec] [-m model] [--thinking extended]
         fps = []; out = None; timeout = 180; model = None; thinking = None; i = 2; gid = args[1]; pp = []
